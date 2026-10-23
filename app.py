@@ -170,4 +170,27 @@ if st.session_state.get("analyze", False):
                 st.info("No clear moving-average trend.")
 
             st.caption(
-                "This
+                            st.caption(
+                "Signals are based on historical prices and moving averages. "
+                "They do not predict future returns."
+            )
+
+            st.subheader("Recent Stock Prices")
+
+            chart_data = data[["Close", "Fast MA", "Slow MA"]].dropna()
+            st.line_chart(chart_data)
+
+            st.subheader("Recent Trading Signals")
+
+            display_data = data[
+                ["Close", "Fast MA", "Slow MA", "RSI", "Signal"]
+            ].tail(10).copy()
+
+            display_data["Signal"] = display_data["Signal"].map(
+                {1: "BULLISH", -1: "BEARISH", 0: "NEUTRAL"}
+            )
+
+            st.dataframe(display_data, use_container_width=True)
+
+        except Exception as e:
+            st.error(f"Analysis failed: {e}")
