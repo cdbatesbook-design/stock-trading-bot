@@ -1,18 +1,3 @@
-"""
-Paper-only automated stock trading worker.
-
-Required environment variables:
-    ALPACA_API_KEY
-    ALPACA_SECRET_KEY
-    SUPABASE_URL
-    SUPABASE_SERVICE_ROLE_KEY
-
-IMPORTANT:
-- Paper trading only.
-- Run one worker instance at a time.
-- Keep bot_status.enabled = false until testing is complete.
-"""
-
 import json
 import logging
 import math
@@ -96,26 +81,26 @@ FILL_ORDER_STATUSES = {
 # ============================================================
 
 logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
 )
 
-log = logging.getLogger("paper-trading-worker")
+log = logging.getLogger("stock_trading_bot")
 
 
 # ============================================================
 # ENVIRONMENT AND CONNECTIONS
 # ============================================================
 
-def required_env(name: str) -> str:
-    value = os.getenv(name, "").strip()
+def required_env(name):
+    value = os.getenv(name)
 
-    if not value:
+    if value is None or not value.strip():
         raise RuntimeError(
             f"Missing required environment variable: {name}"
         )
 
-    return value
+    return value.strip()
 
 
 ALPACA_KEY = required_env("ALPACA_API_KEY")
@@ -124,8 +109,7 @@ ALPACA_SECRET = required_env("ALPACA_SECRET_KEY")
 SUPABASE_URL = required_env("SUPABASE_URL")
 SUPABASE_KEY = required_env("SUPABASE_SERVICE_ROLE_KEY")
 
-
-# Hard-code paper=True so this worker cannot select live trading.
+# Paper trading is deliberately enforced.
 trading = TradingClient(
     ALPACA_KEY,
     ALPACA_SECRET,
@@ -147,75 +131,63 @@ supabase = create_client(
 # GENERAL HELPERS
 # ============================================================
 
-def utc_now() -> str:
+def utc_now():
     return datetime.now(timezone.utc).isoformat()
 
 
-def log_db(
-    level: str,
-    message: str,
-    details: dict | None = None,
-) -> None:
-    """
-    Save logs using columns confirmed in the database.
-
-    bot_logs has no details column, so additional information
-    is appended to message instead.
-    """
-
+def finite_positive(value):
     try:
-        text_message = str(message)
+        number = float(value)
+        return math.isfinite(number) and number > 0
+    except (TypeError, ValueError):
+        return False
 
+
+def log_db(level, message, details=None):
+    try:
         if details:
-            context = json.dumps(
-                details,
-                default=str,
-                separators=(",", ":"),
+            message = (
+                f"{message} | "
+                f"{json.dumps(details, default=str)}"
             )
 
-            text_message += f" | context={context}"
-
-        supabase.table("bot_logs").insert(
-            {
-                "level": str(level).upper()[:50],
-                "message": text_message[:1000],
-                "created_at": utc_now(),
-            }
-        ).execute()
+        supabase.table("bot_logs").insert({
+            "level": str(level).upper(),
+            "message": str(message),
+            "created_at": utc_now(),
+        }).execute()
 
     except Exception:
-        log.exception("Could not write bot_logs record")
+        log.exception("Could not write message to bot_logs")
 
 
-def set_status(message: str, **extra) -> None:
+def set_status(message, **extra):
     """
-    Update the single bot_status row.
+    Update the bot status record.
 
-    The database requires id=1 and mode='paper'.
+    The mode is always forced to paper.
     """
 
-    row = {
+    payload = {
         "id": 1,
         "last_heartbeat": utc_now(),
         "status_message": str(message)[:1000],
         "updated_at": utc_now(),
-        **extra,
+        "mode": "paper",
     }
 
-    # Never allow a caller to change the mode to live.
-    row["mode"] = "paper"
+    payload.update(extra)
 
-    try:
-        supabase.table("bot_status").upsert(
-            row,
-            on_conflict="id",
-        ).execute()
+    # Never allow an extra argument to change trading mode.
+    payload["mode"] = "paper"
 
-    except Exception:
-        log.exception("Could not update bot_status")
+    supabase.table("bot_status").upsert(
+        payload,
+        on_conflict="id",
+    ).execute()
 
 
-def get_bot_config() -> dict:
+def get_bot_config():
     response = (
         supabase.table("bot_status")
         .select("*")
@@ -228,20 +200,18 @@ def get_bot_config() -> dict:
 
     if not rows:
         raise RuntimeError(
-            "bot_status row id=1 is missing"
+            "bot_status row id=1 was not found in Supabase"
         )
 
     return rows[0]
 
 
-def fetch_rows(table: str) -> list[dict]:
+def fetch_rows(table):
     """
-    Fetch table rows in pages rather than relying on one response.
-
-    This avoids silently relying on a single default page size.
+    Read all rows from a Supabase table in pages.
     """
 
-    all_rows = []
+    results = []
     page_size = 500
     start = 0
 
@@ -253,46 +223,46 @@ def fetch_rows(table: str) -> list[dict]:
             .execute()
         )
 
-        page = response.data or []
-        all_rows.extend(page)
+        batch = response.data or []
+        results.extend(batch)
 
-        if len(page) < page_size:
+        if len(batch) < page_size:
             break
 
         start += page_size
 
-    return all_rows
+    return results
 
 
-def get_trade_rows() -> list[dict]:
+def get_trade_rows():
     return fetch_rows("trades")
 
 
-def get_position_rows() -> list[dict]:
+def get_position_rows():
     return fetch_rows("positions")
 
 
 # ============================================================
-# MARKET DATA
+# MARKET DATA AND STRATEGY
 # ============================================================
 
-def latest_price(symbol: str) -> float:
-    response = market_data.get_stock_latest_trade(
-        StockLatestTradeRequest(
-            symbol_or_symbols=[symbol]
-        )
+def latest_price(symbol):
+    request = StockLatestTradeRequest(
+        symbol_or_symbols=[symbol]
     )
+
+    response = market_data.get_stock_latest_trade(request)
 
     trade = response.get(symbol)
 
-    if trade is None or trade.price is None:
+    if trade is None:
         raise RuntimeError(
-            f"No latest trade price for {symbol}"
+            f"No latest trade returned for {symbol}"
         )
 
     price = float(trade.price)
 
-    if not math.isfinite(price) or price <= 0:
+    if not finite_positive(price):
         raise RuntimeError(
             f"Invalid latest price for {symbol}: {price}"
         )
@@ -300,649 +270,295 @@ def latest_price(symbol: str) -> float:
     return price
 
 
-def get_signal(symbol: str) -> tuple[str, dict]:
-    """
-    Basic daily trend strategy.
-
-    BUY when:
-    - Latest completed close is above SMA20.
-    - SMA20 is above SMA50.
-    - RSI is between 45 and 68.
-
-    This is a rule-based signal, not a guarantee of profitability.
-    """
-
-    frame = yf.download(
-        symbol,
-        period="6mo",
-        interval="1d",
-        auto_adjust=True,
-        progress=False,
-        threads=False,
-    )
-
-    if frame is None or frame.empty:
-        return "HOLD", {
-            "reason": "daily close history unavailable"
-        }
-
-    if isinstance(frame.columns, pd.MultiIndex):
-        frame.columns = frame.columns.get_level_values(0)
-
-    if "Close" not in frame.columns:
-        return "HOLD", {
-            "reason": "daily close history unavailable"
-        }
-
-    close = pd.to_numeric(
-        frame["Close"],
-        errors="coerce",
-    ).dropna()
-
-    if len(close) < 61:
-        return "HOLD", {
-            "reason": "insufficient daily history"
-        }
-
-    # Exclude the latest bar because it may be incomplete.
-    close = close.iloc[:-1]
-
-    if len(close) < 50:
-        return "HOLD", {
-            "reason": "insufficient completed daily bars"
-        }
-
-    sma20 = close.rolling(20).mean()
-    sma50 = close.rolling(50).mean()
-
+def calculate_rsi(close, period=RSI_PERIOD):
     delta = close.diff()
+
     gains = delta.clip(lower=0)
     losses = -delta.clip(upper=0)
 
     avg_gain = gains.ewm(
-        alpha=1 / RSI_PERIOD,
-        min_periods=RSI_PERIOD,
+        alpha=1 / period,
+        min_periods=period,
         adjust=False,
     ).mean()
 
     avg_loss = losses.ewm(
-        alpha=1 / RSI_PERIOD,
-        min_periods=RSI_PERIOD,
+        alpha=1 / period,
+        min_periods=period,
         adjust=False,
     ).mean()
 
-    rsi = pd.Series(
-        index=close.index,
-        dtype="float64",
+    relative_strength = avg_gain / avg_loss
+
+    rsi = 100 - (100 / (1 + relative_strength))
+
+    # Handle no-loss and no-movement cases safely.
+    rsi = rsi.where(avg_loss != 0, 100.0)
+
+    no_gain_or_loss = (
+        (avg_gain == 0) & (avg_loss == 0)
     )
 
-    both_zero = (
-        (avg_gain == 0)
-        & (avg_loss == 0)
-    )
+    rsi = rsi.where(~no_gain_or_loss, 50.0)
 
-    no_losses = (
-        (avg_loss == 0)
-        & (avg_gain > 0)
-    )
+    return rsi
 
-    no_gains = (
-        (avg_gain == 0)
-        & (avg_loss > 0)
-    )
 
-    normal = (
-        (avg_gain > 0)
-        & (avg_loss > 0)
-    )
+def get_signal(symbol):
+    """
+    Original strategy:
+    BUY only when:
+      - Last completed daily close > SMA20
+      - SMA20 > SMA50
+      - RSI is between 45 and 68
 
-    rsi.loc[both_zero] = 50.0
-    rsi.loc[no_losses] = 100.0
-    rsi.loc[no_gains] = 0.0
+    Otherwise HOLD.
+    """
 
-    rs = (
-        avg_gain.loc[normal]
-        / avg_loss.loc[normal]
-    )
+    try:
+        frame = yf.download(
+            symbol,
+            period="6mo",
+            interval="1d",
+            auto_adjust=True,
+            progress=False,
+            threads=False,
+        )
 
-    rsi.loc[normal] = 100 - (
-        100 / (1 + rs)
-    )
+        if frame is None or frame.empty:
+            return "HOLD", {
+                "reason": "No historical price data"
+            }
 
-    values = [
-        close.iloc[-1],
-        sma20.iloc[-1],
-        sma50.iloc[-1],
-        rsi.iloc[-1],
-    ]
+        # yfinance may return MultiIndex columns even for
+        # a single ticker. Normalize them before use.
+        if isinstance(frame.columns, pd.MultiIndex):
+            frame.columns = frame.columns.get_level_values(0)
 
-    if any(pd.isna(value) for value in values):
-        return "HOLD", {
-            "reason": "indicator values unavailable"
+        if "Close" not in frame.columns:
+            return "HOLD", {
+                "reason": "Close prices unavailable"
+            }
+
+        close = pd.to_numeric(
+            frame["Close"],
+            errors="coerce",
+        ).dropna()
+
+        # Exclude the current daily candle because it may
+        # still be incomplete.
+        if len(close) > 1:
+            close = close.iloc[:-1]
+
+        if len(close) < 60:
+            return "HOLD", {
+                "reason": "Not enough completed daily candles"
+            }
+
+        sma20 = close.rolling(20).mean()
+        sma50 = close.rolling(50).mean()
+        rsi = calculate_rsi(close)
+
+        last_close = float(close.iloc[-1])
+        last_sma20 = float(sma20.iloc[-1])
+        last_sma50 = float(sma50.iloc[-1])
+        last_rsi = float(rsi.iloc[-1])
+
+        values = [
+            last_close,
+            last_sma20,
+            last_sma50,
+            last_rsi,
+        ]
+
+        if not all(math.isfinite(value) for value in values):
+            return "HOLD", {
+                "reason": "Invalid strategy indicator values"
+            }
+
+        info = {
+            "close": last_close,
+            "sma20": last_sma20,
+            "sma50": last_sma50,
+            "rsi": last_rsi,
         }
 
-    last_close, last_sma20, last_sma50, last_rsi = (
-        map(float, values)
-    )
+        if (
+            last_close > last_sma20
+            and last_sma20 > last_sma50
+            and 45 <= last_rsi <= 68
+        ):
+            return "BUY", info
 
-    info = {
-        "daily_close": last_close,
-        "sma20": last_sma20,
-        "sma50": last_sma50,
-        "rsi": last_rsi,
-    }
+        return "HOLD", info
 
-    if (
-        last_close > last_sma20 > last_sma50
-        and 45 <= last_rsi <= 68
-    ):
-        return "BUY", info
+    except Exception as exc:
+        log.exception("Signal calculation failed for %s", symbol)
 
-    return "HOLD", info
+        return "HOLD", {
+            "reason": str(exc)[:500]
+        }
 
 
 # ============================================================
-# ORDER AND TRADE HELPERS
+# TRADE AND POSITION RECORDS
 # ============================================================
 
-def order_status(order) -> str:
+def order_status(order):
     status = getattr(order, "status", "")
-    return str(
-        getattr(status, "value", status)
-    ).lower()
+    return str(status).lower()
 
 
 def write_trade(
-    order_id: str,
-    symbol: str,
-    side: str,
-    quantity: float,
-    price: float | None,
-    status: str,
-    strategy: str,
-    reason: str,
-    total_value: float | None = None,
-) -> None:
+    order_id,
+    symbol,
+    side,
+    quantity,
+    price,
+    status,
+    strategy,
+    reason,
+    total_value=None,
+):
     """
-    Insert or update a trade using the confirmed unique
-    trades.order_id constraint.
+    Upsert using the unique order_id column.
     """
 
-    row = {
-        "order_id": order_id,
-        "symbol": symbol,
-        "side": side.lower(),
-        "quantity": float(quantity),
-        "price": (
-            float(price)
-            if price is not None
-            else None
-        ),
-        "total_value": (
-            float(total_value)
-            if total_value is not None
-            else None
-        ),
-        "strategy": strategy,
-        "reason": str(reason)[:1000],
-        "status": status.lower(),
+    payload = {
+        "order_id": str(order_id),
+        "symbol": str(symbol),
+        "side": str(side).lower(),
+        "quantity": float(quantity or 0),
+        "price": float(price or 0),
+        "status": str(status).lower(),
+        "strategy": str(strategy),
+        "reason": str(reason),
+        "updated_at": utc_now(),
     }
+
+    if total_value is not None:
+        payload["total_value"] = float(total_value)
 
     existing = (
         supabase.table("trades")
-        .select("id")
-        .eq("order_id", order_id)
+        .select("order_id")
+        .eq("order_id", str(order_id))
         .limit(1)
         .execute()
-        .data
-        or []
     )
 
-    if not existing:
-        row["created_at"] = utc_now()
+    if not existing.data:
+        payload["created_at"] = utc_now()
 
     supabase.table("trades").upsert(
-        row,
+        payload,
         on_conflict="order_id",
     ).execute()
 
 
-# ============================================================
-# POSITION TRACKING
-# ============================================================
-
 def upsert_position(
-    symbol: str,
-    quantity: float,
-    entry_price: float,
-    current_price: float,
-    status: str,
-) -> None:
+    symbol,
+    quantity,
+    entry_price,
+    current_price,
+    status,
+):
     """
-    Update the current open position by id or insert a new one.
+    Update the most recent open position for this symbol,
+    or insert a new position if none exists.
 
-    The confirmed database has no UNIQUE(symbol) constraint.
-    Therefore this function does not use ON CONFLICT(symbol).
-
-    Closed rows are retained as history.
+    This does not require a unique constraint on symbol.
     """
+
+    response = (
+        supabase.table("positions")
+        .select("*")
+        .eq("symbol", symbol)
+        .eq("status", "open")
+        .order("updated_at", desc=True)
+        .limit(1)
+        .execute()
+    )
 
     now = utc_now()
 
-    row = {
+    payload = {
         "symbol": symbol,
         "quantity": float(quantity),
         "entry_price": float(entry_price),
         "current_price": float(current_price),
-        "status": status,
+        "status": str(status).lower(),
         "updated_at": now,
     }
 
-    if status == "open":
-        row["closed_at"] = None
+    if str(status).lower() == "open":
+        payload["closed_at"] = None
 
-        existing_rows = (
-            supabase.table("positions")
-            .select("id,opened_at")
-            .eq("symbol", symbol)
-            .eq("status", "open")
-            .order("id", desc=True)
-            .limit(1)
-            .execute()
-            .data
-            or []
-        )
+    if response.data:
+        position_id = response.data[0].get("id")
 
-        if existing_rows:
-            existing = existing_rows[0]
-
-            row["opened_at"] = (
-                existing.get("opened_at") or now
-            )
-
-            (
-                supabase.table("positions")
-                .update(row)
-                .eq("id", existing["id"])
-                .execute()
-            )
-
-        else:
-            row["opened_at"] = now
-
-            supabase.table("positions").insert(
-                row
-            ).execute()
-
-    elif status == "closed":
-        row["closed_at"] = now
-
-        open_rows = (
-            supabase.table("positions")
-            .select("id")
-            .eq("symbol", symbol)
-            .eq("status", "open")
-            .execute()
-            .data
-            or []
-        )
-
-        for existing in open_rows:
-            (
-                supabase.table("positions")
-                .update(row)
-                .eq("id", existing["id"])
-                .execute()
-            )
+        supabase.table("positions").update(
+            payload
+        ).eq("id", position_id).execute()
 
     else:
-        raise ValueError(
-            f"Unsupported position status: {status}"
-        )
+        payload["opened_at"] = now
+
+        if str(status).lower() == "closed":
+            payload["closed_at"] = now
+
+        supabase.table("positions").insert(
+            payload
+        ).execute()
 
 
-# ============================================================
-# ORDER RECONCILIATION
-# ============================================================
-
-def reconcile_orders() -> None:
-    """
-    Check unresolved orders with Alpaca.
-
-    Ambiguous API errors are not treated as proof that an order
-    failed. Never blindly resubmit an uncertain order.
-    """
-
-    for row in get_trade_rows():
-        order_id = str(row.get("order_id") or "")
-        status_in_db = str(
-            row.get("status") or ""
-        ).lower()
-
-        if (
-            not order_id
-            or status_in_db in FINAL_ORDER_STATUSES
-        ):
-            continue
-
-        try:
-            order = trading.get_order_by_client_id(
-                order_id
-            )
-
-        except Exception as exc:
-            log.warning(
-                "Order %s still unresolved: %s",
-                order_id,
-                exc,
-            )
-            continue
-
-        broker_status = order_status(order)
-
-        filled_qty = float(
-            getattr(order, "filled_qty", 0) or 0
-        )
-
-        avg = getattr(
-            order,
-            "filled_avg_price",
-            None,
-        )
-
-        fill_price = (
-            float(avg)
-            if avg not in (None, "")
-            else None
-        )
-
-        if filled_qty > 0:
-            if broker_status == "filled":
-                recorded_status = "filled"
-            else:
-                recorded_status = "partial_filled"
-
-            recorded_qty = filled_qty
-
-            recorded_price = (
-                fill_price
-                if fill_price is not None
-                else row.get("price")
-            )
-
-        else:
-            recorded_status = broker_status
-            recorded_qty = float(
-                row.get("quantity") or 0
-            )
-            recorded_price = row.get("price")
-
-        try:
-            write_trade(
-                order_id=order_id,
-                symbol=str(row["symbol"]),
-                side=str(row["side"]),
-                quantity=recorded_qty,
-                price=recorded_price,
-                status=recorded_status,
-                strategy=str(
-                    row.get("strategy") or "daily-trend"
-                ),
-                reason=str(row.get("reason") or ""),
-                total_value=(
-                    filled_qty * fill_price
-                    if (
-                        filled_qty > 0
-                        and fill_price is not None
-                    )
-                    else row.get("total_value")
-                ),
-            )
-
-        except Exception:
-            log.exception(
-                "Failed to save broker status for %s",
-                order_id,
-            )
-            continue
-
-        if filled_qty > 0:
-            try:
-                sync_position_from_broker(
-                    str(row["symbol"])
-                )
-
-                if broker_status in {
-                    "filled",
-                    "canceled",
-                    "cancelled",
-                    "expired",
-                    "rejected",
-                }:
-                    (
-                        supabase.table("trades")
-                        .update({"status": "synced"})
-                        .eq("order_id", order_id)
-                        .execute()
-                    )
-
-            except Exception:
-                log.exception(
-                    "Position sync failed for %s; "
-                    "will retry next scan",
-                    order_id,
-                )
-
-
-# ============================================================
-# POSITION LEDGER AND ACCOUNTING
-# ============================================================
-
-def calculate_managed_position(
-    trades: list[dict],
-    symbol: str,
-) -> tuple[float, float]:
-    """
-    Calculate bot-managed long quantity and average cost.
-
-    Requires filled trades to have reliable timestamps and
-    actual fill quantities/prices for accurate accounting.
-    """
-
-    relevant = [
-        trade
-        for trade in trades
-        if (
-            str(trade.get("symbol") or "") == symbol
-            and str(
-                trade.get("status") or ""
-            ).lower() in FILL_ORDER_STATUSES
-            and str(
-                trade.get("side") or ""
-            ).lower() in {"buy", "sell"}
-        )
-    ]
-
-    relevant.sort(
-        key=lambda trade: str(
-            trade.get("created_at") or ""
-        )
-    )
-
-    quantity = 0.0
-    basis = 0.0
-
-    for trade in relevant:
-        side = str(
-            trade.get("side") or ""
-        ).lower()
-
-        qty = float(
-            trade.get("quantity") or 0
-        )
-
-        price = float(
-            trade.get("price") or 0
-        )
-
-        if qty <= 0 or price <= 0:
-            continue
-
-        if side == "buy":
-            if quantity <= 1e-8:
-                quantity = 0.0
-                basis = 0.0
-
-            new_qty = quantity + qty
-
-            basis = (
-                (quantity * basis) + (qty * price)
-            ) / new_qty
-
-            quantity = new_qty
-
-        elif side == "sell":
-            sold = min(qty, quantity)
-            quantity -= sold
-
-            if quantity <= 1e-8:
-                quantity = 0.0
-                basis = 0.0
-
-    return quantity, basis
-
-
-def sync_position_from_broker(symbol: str) -> None:
-    """
-    Rebuild the bot-managed position from the trade ledger
-    and compare it with Alpaca's paper-account holdings.
-    """
-
-    trades = []
-    page_size = 500
-    start = 0
-
-    while True:
-        page = (
-            supabase.table("trades")
-            .select("*")
-            .eq("symbol", symbol)
-            .range(start, start + page_size - 1)
-            .execute()
-            .data
-            or []
-        )
-
-        trades.extend(page)
-
-        if len(page) < page_size:
-            break
-
-        start += page_size
-
-    managed_qty, entry_price = (
-        calculate_managed_position(
-            trades,
-            symbol,
-        )
-    )
-
-    if managed_qty <= 1e-8:
-        upsert_position(
-            symbol,
-            0,
-            0,
-            0,
-            "closed",
-        )
-        return
-
-    broker_positions = trading.get_all_positions()
-
-    broker_pos = next(
-        (
-            position
-            for position in broker_positions
-            if position.symbol == symbol
-        ),
-        None,
-    )
-
-    if broker_pos is None:
-        raise RuntimeError(
-            f"Trade ledger has {managed_qty} shares "
-            f"of {symbol}, but Alpaca reports none"
-        )
-
-    broker_qty = float(broker_pos.qty)
-
-    if broker_qty + 1e-8 < managed_qty:
-        raise RuntimeError(
-            f"Ledger has {managed_qty} shares of "
-            f"{symbol}, Alpaca reports {broker_qty}"
-        )
-
-    upsert_position(
-        symbol,
-        managed_qty,
-        entry_price,
-        float(broker_pos.current_price),
-        "open",
-    )
-
-
-def active_bot_positions() -> list[dict]:
+def active_bot_positions():
     rows = get_position_rows()
 
-    return [
-        position
-        for position in rows
+    active = []
+
+    for row in rows:
+        try:
+            quantity = float(row.get("quantity") or 0)
+        except (TypeError, ValueError):
+            continue
+
         if (
-            str(position.get("status") or "").lower()
-            == "open"
-            and float(
-                position.get("quantity") or 0
-            ) > 0
-        )
-    ]
+            str(row.get("status", "")).lower() == "open"
+            and quantity > 0
+        ):
+            active.append(row)
+
+    return active
 
 
-def unresolved_status(status: str) -> bool:
-    return status not in FINAL_ORDER_STATUSES
+def unresolved_status(status):
+    return str(status or "").lower() not in FINAL_ORDER_STATUSES
 
 
-def has_unresolved_order(
-    symbol: str | None = None,
-) -> bool:
+def has_unresolved_order(symbol=None):
     for row in get_trade_rows():
+        if symbol and row.get("symbol") != symbol:
+            continue
+
         if not row.get("order_id"):
             continue
 
-        if (
-            symbol is not None
-            and row.get("symbol") != symbol
-        ):
-            continue
-
-        status = str(
-            row.get("status") or ""
-        ).lower()
-
-        if unresolved_status(status):
+        if unresolved_status(row.get("status")):
             return True
 
     return False
 
 
 # ============================================================
-# ACCOUNT AND BUDGET HELPERS
+# BROKER ACCOUNT AND POSITIONS
 # ============================================================
 
-def account_equity() -> float:
+def account_equity():
     account = trading.get_account()
     equity = float(account.equity)
 
-    if not math.isfinite(equity) or equity <= 0:
+    if not finite_positive(equity):
         raise RuntimeError(
             f"Invalid account equity: {equity}"
         )
@@ -950,51 +566,289 @@ def account_equity() -> float:
     return equity
 
 
-def broker_positions_by_symbol() -> dict:
-    return {
-        position.symbol: position
-        for position in trading.get_all_positions()
-    }
+def broker_positions_by_symbol():
+    result = {}
+
+    for position in trading.get_all_positions():
+        symbol = str(position.symbol)
+
+        try:
+            quantity = float(position.qty)
+        except (TypeError, ValueError):
+            quantity = 0.0
+
+        result[symbol] = {
+            "quantity": quantity,
+            "market_value": float(
+                getattr(position, "market_value", 0) or 0
+            ),
+            "entry_price": float(
+                getattr(position, "avg_entry_price", 0) or 0
+            ),
+        }
+
+    return result
 
 
-def committed_value(positions: list[dict]) -> float:
+def committed_value(positions):
     total = 0.0
 
     for position in positions:
-        qty = float(
-            position.get("quantity") or 0
-        )
+        try:
+            quantity = float(position.get("quantity") or 0)
 
-        price = float(
-            position.get("current_price")
-            or position.get("entry_price")
-            or 0
-        )
+            current_price = float(
+                position.get("current_price")
+                or position.get("entry_price")
+                or 0
+            )
 
-        total += qty * price
+            if (
+                math.isfinite(quantity)
+                and math.isfinite(current_price)
+            ):
+                total += quantity * current_price
+
+        except (TypeError, ValueError):
+            continue
 
     return total
 
 
-# ============================================================
-# ORDER SUBMISSION
-# ============================================================
+def calculate_managed_position(trades, symbol):
+    """
+    Calculate the bot-managed net long position and average
+    cost from recorded filled buy and sell orders.
+    """
 
-def place_market_order(
-    symbol: str,
-    side: OrderSide,
-    qty: int,
-    reason: str,
-) -> str:
-    if qty < 1:
-        raise ValueError(
-            "Order quantity must be at least one whole share"
+    symbol_trades = [
+        row for row in trades
+        if row.get("symbol") == symbol
+        and str(row.get("status", "")).lower()
+        in FILL_ORDER_STATUSES
+    ]
+
+    symbol_trades.sort(
+        key=lambda row: str(row.get("created_at") or "")
+    )
+
+    quantity = 0.0
+    cost_basis = 0.0
+
+    for row in symbol_trades:
+        side = str(row.get("side", "")).lower()
+
+        try:
+            trade_quantity = float(row.get("quantity") or 0)
+            price = float(row.get("price") or 0)
+        except (TypeError, ValueError):
+            continue
+
+        if (
+            not math.isfinite(trade_quantity)
+            or not math.isfinite(price)
+            or trade_quantity <= 0
+            or price <= 0
+        ):
+            continue
+
+        if side == "buy":
+            cost_basis += trade_quantity * price
+            quantity += trade_quantity
+
+        elif side == "sell":
+            if quantity <= 0:
+                continue
+
+            average_cost = cost_basis / quantity
+            sold_quantity = min(trade_quantity, quantity)
+
+            quantity -= sold_quantity
+            cost_basis -= sold_quantity * average_cost
+
+            if quantity <= 0.000001:
+                quantity = 0.0
+                cost_basis = 0.0
+
+    average_cost = (
+        cost_basis / quantity if quantity > 0 else 0.0
+    )
+
+    return quantity, average_cost
+
+
+def sync_position_from_broker(symbol):
+    """
+    Rebuild the bot-managed position from the trade ledger.
+    Unknown broker holdings are not automatically adopted.
+    """
+
+    trades = get_trade_rows()
+
+    quantity, entry_price = calculate_managed_position(
+        trades,
+        symbol,
+    )
+
+    if quantity <= 0:
+        response = (
+            supabase.table("positions")
+            .select("*")
+            .eq("symbol", symbol)
+            .eq("status", "open")
+            .execute()
         )
 
-    if side not in {
-        OrderSide.BUY,
-        OrderSide.SELL,
-    }:
+        for row in response.data or []:
+            supabase.table("positions").update({
+                "quantity": 0,
+                "status": "closed",
+                "updated_at": utc_now(),
+                "closed_at": utc_now(),
+            }).eq("id", row["id"]).execute()
+
+        return
+
+    broker_positions = broker_positions_by_symbol()
+    broker_position = broker_positions.get(symbol)
+
+    if broker_position is None:
+        raise RuntimeError(
+            f"Trade ledger shows {symbol}, but Alpaca "
+            "has no corresponding position"
+        )
+
+    broker_quantity = float(
+        broker_position.get("quantity") or 0
+    )
+
+    if broker_quantity + 0.000001 < quantity:
+        raise RuntimeError(
+            f"Managed quantity for {symbol} ({quantity}) "
+            f"exceeds Alpaca quantity ({broker_quantity})"
+        )
+
+    price = latest_price(symbol)
+
+    upsert_position(
+        symbol=symbol,
+        quantity=quantity,
+        entry_price=entry_price,
+        current_price=price,
+        status="open",
+    )
+
+
+# ============================================================
+# ORDER RECONCILIATION
+# ============================================================
+
+def reconcile_orders():
+    """
+    Reconcile pending orders with Alpaca by client order ID.
+    Never resubmit an order just because its result is unclear.
+    """
+
+    rows = get_trade_rows()
+
+    for row in rows:
+        current_status = str(
+            row.get("status") or ""
+        ).lower()
+
+        if current_status in FINAL_ORDER_STATUSES:
+            continue
+
+        client_order_id = row.get("order_id")
+
+        if not client_order_id:
+            continue
+
+        try:
+            order = trading.get_order_by_client_id(
+                client_order_id
+            )
+
+        except Exception as exc:
+            log.warning(
+                "Order reconciliation deferred for %s: %s",
+                client_order_id,
+                exc,
+            )
+            continue
+
+        broker_status = order_status(order)
+
+        filled_quantity = float(
+            getattr(order, "filled_qty", 0) or 0
+        )
+
+        filled_price = float(
+            getattr(order, "filled_avg_price", 0) or 0
+        )
+
+        if filled_quantity > 0 and filled_price > 0:
+            total_value = filled_quantity * filled_price
+
+            write_trade(
+                order_id=client_order_id,
+                symbol=row.get("symbol"),
+                side=row.get("side"),
+                quantity=filled_quantity,
+                price=filled_price,
+                status=broker_status,
+                strategy=row.get("strategy", ""),
+                reason=row.get("reason", ""),
+                total_value=total_value,
+            )
+
+            if broker_status in FINAL_ORDER_STATUSES:
+                sync_position_from_broker(
+                    row.get("symbol")
+                )
+
+                write_trade(
+                    order_id=client_order_id,
+                    symbol=row.get("symbol"),
+                    side=row.get("side"),
+                    quantity=filled_quantity,
+                    price=filled_price,
+                    status="synced",
+                    strategy=row.get("strategy", ""),
+                    reason=row.get("reason", ""),
+                    total_value=total_value,
+                )
+
+        else:
+            write_trade(
+                order_id=client_order_id,
+                symbol=row.get("symbol"),
+                side=row.get("side"),
+                quantity=float(row.get("quantity") or 0),
+                price=float(row.get("price") or 0),
+                status=broker_status,
+                strategy=row.get("strategy", ""),
+                reason=row.get("reason", ""),
+                total_value=row.get("total_value"),
+            )
+
+
+# ============================================================
+# ORDER PLACEMENT
+# ============================================================
+
+def place_market_order(symbol, side, qty, reason):
+    """
+    Record order intent before submission. If submission has
+    an ambiguous result, do not automatically retry it.
+    """
+
+    if not isinstance(qty, int) or qty < 1:
+        raise ValueError(
+            f"Order quantity must be a positive integer: {qty}"
+        )
+
+    if side not in (OrderSide.BUY, OrderSide.SELL):
         raise ValueError("Invalid order side")
 
     if has_unresolved_order(symbol):
@@ -1007,17 +861,15 @@ def place_market_order(
         f"{uuid.uuid4().hex[:20]}"
     )
 
-    # Persist an intent before submitting.
-    # If the API call has an ambiguous outcome, do not resubmit.
     write_trade(
-        client_order_id,
-        symbol,
-        side.value,
-        qty,
-        None,
-        "intent",
-        "daily-trend",
-        reason,
+        order_id=client_order_id,
+        symbol=symbol,
+        side=side.value,
+        quantity=qty,
+        price=0,
+        status="pending",
+        strategy="SMA20>SMA50_RSI45-68",
+        reason=reason,
     )
 
     request = MarketOrderRequest(
@@ -1029,115 +881,133 @@ def place_market_order(
     )
 
     try:
-        order = trading.submit_order(
-            order_data=request
-        )
+        order = trading.submit_order(order_data=request)
 
     except Exception as exc:
         log.exception(
-            "Submission outcome uncertain for %s",
+            "Order submission result may be ambiguous for %s",
             symbol,
         )
 
         log_db(
             "ERROR",
-            "Order submission outcome uncertain",
+            "Order submission exception; manual reconciliation "
+            "required before any retry",
             {
                 "symbol": symbol,
-                "order_id": client_order_id,
+                "client_order_id": client_order_id,
                 "error": str(exc),
             },
         )
 
-        raise
+        raise RuntimeError(
+            "Order submission failed or has an ambiguous result. "
+            "The order was not automatically retried."
+        ) from exc
 
-    try:
-        write_trade(
-            client_order_id,
-            symbol,
-            side.value,
-            qty,
-            None,
-            order_status(order),
-            "daily-trend",
-            reason,
-        )
+    broker_status = order_status(order)
 
-    except Exception:
-        log.exception(
-            "Order submitted but local status update failed: %s",
-            client_order_id,
-        )
+    write_trade(
+        order_id=client_order_id,
+        symbol=symbol,
+        side=side.value,
+        quantity=qty,
+        price=0,
+        status=broker_status,
+        strategy="SMA20>SMA50_RSI45-68",
+        reason=reason,
+    )
 
-    return client_order_id
+    log.info(
+        "Submitted %s order: %s shares of %s; status=%s",
+        side.value,
+        qty,
+        symbol,
+        broker_status,
+    )
+
+    return order
 
 
 # ============================================================
 # EXIT MANAGEMENT
 # ============================================================
 
-def manage_exits() -> None:
-    for position in active_bot_positions():
-        symbol = str(position["symbol"])
+def manage_exits():
+    positions = active_bot_positions()
 
-        qty_float = float(
-            position.get("quantity") or 0
-        )
+    for position in positions:
+        symbol = position.get("symbol")
 
-        qty = int(
-            math.floor(qty_float + 1e-8)
-        )
+        if not symbol:
+            continue
 
-        entry = float(
-            position.get("entry_price") or 0
-        )
-
-        if (
-            qty < 1
-            or entry <= 0
-            or has_unresolved_order(symbol)
-        ):
+        if has_unresolved_order(symbol):
+            log.info(
+                "Skipping exit check for %s: unresolved order",
+                symbol,
+            )
             continue
 
         try:
-            price = latest_price(symbol)
-            pnl = (price - entry) / entry
+            quantity = int(
+                float(position.get("quantity") or 0)
+            )
 
-            if pnl <= -STOP_LOSS_PERCENT:
-                place_market_order(
-                    symbol,
-                    OrderSide.SELL,
-                    qty,
-                    (
-                        "stop loss threshold; "
-                        f"return={pnl:.2%}"
-                    ),
+            entry_price = float(
+                position.get("entry_price") or 0
+            )
+
+            if quantity < 1 or not finite_positive(entry_price):
+                continue
+
+            price = latest_price(symbol)
+
+            profit_percent = (
+                (price - entry_price) / entry_price
+            )
+
+            if profit_percent <= -STOP_LOSS_PERCENT:
+                reason = (
+                    f"Stop-loss triggered: "
+                    f"{profit_percent:.2%} return"
                 )
 
-            elif pnl >= TAKE_PROFIT_PERCENT:
                 place_market_order(
                     symbol,
                     OrderSide.SELL,
-                    qty,
-                    (
-                        "take profit threshold; "
-                        f"return={pnl:.2%}"
-                    ),
+                    quantity,
+                    reason,
+                )
+
+                log.info(
+                    "Stop-loss sell submitted for %s",
+                    symbol,
+                )
+
+            elif profit_percent >= TAKE_PROFIT_PERCENT:
+                reason = (
+                    f"Take-profit triggered: "
+                    f"{profit_percent:.2%} return"
+                )
+
+                place_market_order(
+                    symbol,
+                    OrderSide.SELL,
+                    quantity,
+                    reason,
+                )
+
+                log.info(
+                    "Take-profit sell submitted for %s",
+                    symbol,
                 )
 
             else:
-                (
-                    supabase.table("positions")
-                    .update(
-                        {
-                            "current_price": price,
-                            "updated_at": utc_now(),
-                        }
-                    )
-                    .eq("symbol", symbol)
-                    .eq("status", "open")
-                    .execute()
-                )
+                supabase.table("positions").update({
+                    "current_price": price,
+                    "updated_at": utc_now(),
+                }).eq("id", position["id"]).execute()
 
         except Exception as exc:
             log.exception(
@@ -1156,64 +1026,76 @@ def manage_exits() -> None:
 
 
 # ============================================================
-# BUY VALIDATION
+# BUY SAFETY CHECKS
 # ============================================================
 
-def can_buy(
-    symbol: str,
-    price: float,
-    positions: list[dict],
-    broker_positions: dict,
-) -> tuple[bool, str]:
-
-    if not math.isfinite(price) or price <= 0:
-        return False, "invalid price"
+def can_buy(symbol, price, positions, broker_positions):
+    if not finite_positive(price):
+        return False, "Invalid price"
 
     if has_unresolved_order(symbol):
-        return False, "unresolved order exists for symbol"
+        return False, "Unresolved order exists"
 
-    if any(
-        str(position.get("symbol")) == symbol
-        for position in positions
-    ):
-        return False, "already have a bot-managed position"
+    for position in positions:
+        if position.get("symbol") == symbol:
+            return False, "Already have a bot-managed position"
 
-    # Do not adopt or add to unknown broker holdings automatically.
     if symbol in broker_positions:
-        return False, (
-            "symbol already exists in Alpaca holdings; "
-            "manual reconciliation required"
-        )
+        return False, "Broker already holds this symbol"
 
     if len(positions) >= MAX_OPEN_POSITIONS:
-        return False, "maximum open positions reached"
+        return False, "Maximum open positions reached"
 
-    remaining = max(
-        0.0,
-        VIRTUAL_BUDGET - committed_value(positions),
-    )
+    invested = committed_value(positions)
+    remaining_budget = VIRTUAL_BUDGET - invested
 
-    allowed_value = min(
+    if remaining_budget < price:
+        return False, "Virtual budget exhausted"
+
+    if min(
         MAX_POSITION_VALUE,
-        remaining,
-    )
+        remaining_budget,
+    ) < price:
+        return False, "Price exceeds allowed position value"
 
-    if allowed_value < price:
-        return False, "budget too small for one share"
-
-    return True, f"allowed_value={allowed_value:.2f}"
+    return True, "Approved"
 
 
 # ============================================================
 # MAIN SCAN
 # ============================================================
 
-def scan_once() -> None:
+def scan_once():
+    """
+    Run one worker cycle.
+
+    PATCH:
+    Update last_scan and last_heartbeat immediately so the
+    dashboard shows the worker is checking in even when the
+    bot is paused or the market is closed.
+    """
+
+    cycle_time = utc_now()
+
+    try:
+        set_status(
+            "Worker check started; paper mode enforced",
+            last_scan=cycle_time,
+            mode="paper",
+        )
+
+    except Exception:
+        log.exception(
+            "Could not update worker heartbeat at cycle start"
+        )
+        raise
+
     config = get_bot_config()
 
     if config.get("enabled") is not True:
         set_status(
             "Paused: bot_status.enabled is not true",
+            last_scan=cycle_time,
             mode="paper",
         )
 
@@ -1221,16 +1103,17 @@ def scan_once() -> None:
         return
 
     if (
-        str(config.get("mode") or "").lower() != "paper"
-        or not PAPER_MODE
+        not PAPER_MODE
+        or str(config.get("mode", "paper")).lower() != "paper"
     ):
         set_status(
-            "Blocked: paper mode is required",
+            "SAFETY STOP: only paper trading is permitted",
+            last_scan=cycle_time,
             mode="paper",
         )
 
         raise RuntimeError(
-            "Refusing to trade unless paper mode is enabled"
+            "Live trading is disabled by this worker"
         )
 
     reconcile_orders()
@@ -1240,32 +1123,33 @@ def scan_once() -> None:
         equity = account_equity()
         broker_positions = broker_positions_by_symbol()
 
-    except Exception:
+    except Exception as exc:
         set_status(
-            "Safety stop: broker account, clock, "
-            "or positions unavailable",
+            f"Safety stop: broker/account check failed: "
+            f"{str(exc)[:500]}",
+            last_scan=cycle_time,
             mode="paper",
         )
 
-        log.exception(
-            "Broker checks failed; no new entries"
-        )
-
+        log.exception("Broker safety check failed")
         return
 
     if not clock.is_open:
         set_status(
             "Waiting: market is closed",
+            last_scan=cycle_time,
             mode="paper",
         )
+
+        log.info("Market is closed; no trades submitted")
         return
 
     manage_exits()
 
-    # Wait while any order remains unresolved.
     if has_unresolved_order():
         set_status(
             "Waiting: unresolved order requires reconciliation",
+            last_scan=cycle_time,
             mode="paper",
         )
         return
@@ -1274,27 +1158,31 @@ def scan_once() -> None:
         positions = active_bot_positions()
 
         if len(positions) >= MAX_OPEN_POSITIONS:
+            log.info(
+                "Maximum open positions reached; ending scan"
+            )
             break
 
         if any(
-            str(position.get("symbol")) == symbol
+            position.get("symbol") == symbol
             for position in positions
         ):
             continue
 
         if symbol in broker_positions:
-            log.warning(
-                "Skipping %s: broker already holds this symbol",
+            continue
+
+        signal, info = get_signal(symbol)
+
+        if signal != "BUY":
+            log.info(
+                "%s: HOLD; details=%s",
                 symbol,
+                info,
             )
             continue
 
         try:
-            signal, info = get_signal(symbol)
-
-            if signal != "BUY":
-                continue
-
             price_before = latest_price(symbol)
 
             allowed, reason = can_buy(
@@ -1306,99 +1194,121 @@ def scan_once() -> None:
 
             if not allowed:
                 log.info(
-                    "Skipping %s: %s",
+                    "%s: purchase skipped: %s",
                     symbol,
                     reason,
                 )
                 continue
 
-            remaining = max(
-                0.0,
-                VIRTUAL_BUDGET - committed_value(positions),
+            invested = committed_value(positions)
+            remaining_budget = (
+                VIRTUAL_BUDGET - invested
             )
 
             max_value = min(
                 MAX_POSITION_VALUE,
-                remaining,
+                remaining_budget,
             )
 
-            qty = int(
-                math.floor(max_value / price_before)
+            qty = math.floor(
+                max_value / price_before
             )
 
             if qty < 1:
+                log.info(
+                    "%s: price is above the permitted "
+                    "position amount",
+                    symbol,
+                )
                 continue
 
-            # Check buying power again before submission.
             account = trading.get_account()
-            buying_power = float(account.buying_power)
 
-            if (
-                not math.isfinite(buying_power)
-                or buying_power < qty * price_before
-            ):
+            buying_power = float(
+                getattr(account, "buying_power", 0) or 0
+            )
+
+            if not math.isfinite(buying_power):
                 log.warning(
-                    "Skipping %s: insufficient buying power",
+                    "%s: invalid broker buying power",
+                    symbol,
+                )
+                continue
+
+            if qty * price_before > buying_power:
+                log.info(
+                    "%s: insufficient broker buying power",
                     symbol,
                 )
                 continue
 
             price_now = latest_price(symbol)
 
-            if (
-                price_now
-                > price_before * (1 + MAX_PRICE_DRIFT_PERCENT)
-            ):
-                log.warning(
-                    "Skipping %s: price moved more than tolerance",
+            drift = abs(
+                price_now - price_before
+            ) / price_before
+
+            if drift > MAX_PRICE_DRIFT_PERCENT:
+                log.info(
+                    "%s: skipped because price drift was %.2f%%",
+                    symbol,
+                    drift * 100,
+                )
+                continue
+
+            qty = math.floor(
+                max_value / price_now
+            )
+
+            if qty < 1:
+                continue
+
+            estimated_value = qty * price_now
+
+            if estimated_value > MAX_POSITION_VALUE:
+                log.info(
+                    "%s: skipped because position exceeds limit",
                     symbol,
                 )
                 continue
 
-            # Recalculate the share count at the latest price.
-            qty = min(
-                qty,
-                int(math.floor(max_value / price_now)),
-            )
-
-            if (
-                qty < 1
-                or qty * price_now > MAX_POSITION_VALUE
-            ):
-                continue
-
-            # Do not submit if another order became unresolved.
             if has_unresolved_order():
+                log.warning(
+                    "Unresolved order detected; ending scan"
+                )
                 break
 
-            order_reason = (
-                "daily trend signal; "
-                f"reference_price={price_now:.4f}; "
-                f"RSI={info.get('rsi', 0):.2f}; "
-                f"account_equity={equity:.2f}"
+            reason = (
+                f"Strategy entry: close={info.get('close')}, "
+                f"SMA20={info.get('sma20')}, "
+                f"SMA50={info.get('sma50')}, "
+                f"RSI={info.get('rsi')}; "
+                f"reference_price={price_now}; "
+                f"account_equity={equity}"
             )
 
             place_market_order(
                 symbol,
                 OrderSide.BUY,
                 qty,
-                order_reason,
+                reason,
             )
 
             log.info(
-                "Submitted paper BUY %s qty=%s "
-                "estimated_value=%.2f",
-                symbol,
+                "BUY submitted: %s shares of %s at reference "
+                "price %.4f",
                 qty,
-                qty * price_now,
+                symbol,
+                price_now,
             )
 
-            # Submit no more than one new entry per scan.
+            # Preserve original behavior: at most one new
+            # buy order per scan.
             break
 
         except Exception as exc:
             log.exception(
-                "Scan failed for %s",
+                "Scan failed while evaluating %s",
                 symbol,
             )
 
@@ -1411,12 +1321,13 @@ def scan_once() -> None:
                 },
             )
 
-            if has_unresolved_order():
-                break
+            # Do not keep submitting new orders after an
+            # order-related or data-related exception.
+            break
 
     set_status(
         "Scan completed",
-        last_scan=utc_now(),
+        last_scan=cycle_time,
         mode="paper",
     )
 
@@ -1425,14 +1336,15 @@ def scan_once() -> None:
 # WORKER LOOP
 # ============================================================
 
-def main() -> None:
+def main():
     set_status(
         "Worker starting; paper mode enforced",
+        last_scan=utc_now(),
         mode="paper",
     )
 
     log.info(
-        "Paper worker started; scan interval %ss",
+        "Paper worker started; scan interval %s seconds",
         SCAN_INTERVAL_SECONDS,
     )
 
@@ -1449,10 +1361,17 @@ def main() -> None:
                 {"error": str(exc)},
             )
 
-            set_status(
-                f"Scan cycle error: {str(exc)[:800]}",
-                mode="paper",
-            )
+            try:
+                set_status(
+                    f"Scan cycle error: {str(exc)[:800]}",
+                    last_scan=utc_now(),
+                    mode="paper",
+                )
+
+            except Exception:
+                log.exception(
+                    "Could not update Supabase after scan error"
+                )
 
         time.sleep(SCAN_INTERVAL_SECONDS)
 
