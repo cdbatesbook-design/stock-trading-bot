@@ -23,6 +23,10 @@ from alpaca.data.requests import StockLatestTradeRequest
 # CONFIGURATION
 # ============================================================
 
+# SAFETY: Alpaca paper trading is enforced below.
+# The bot also requires enabled=True in Supabase before
+# it can evaluate or submit orders.
+
 PAPER_MODE = True
 
 WATCHLIST = [
@@ -60,6 +64,17 @@ SCAN_INTERVAL_SECONDS = 300
 MAX_PRICE_DRIFT_PERCENT = 0.01
 RSI_PERIOD = 14
 
+# Broker order statuses that mean the broker considers
+# an order terminal. Partial fills must still be accounted for.
+BROKER_TERMINAL_STATUSES = {
+    "filled",
+    "canceled",
+    "cancelled",
+    "expired",
+    "rejected",
+}
+
+# Application statuses that no longer require reconciliation.
 FINAL_ORDER_STATUSES = {
     "synced",
     "canceled",
@@ -68,6 +83,7 @@ FINAL_ORDER_STATUSES = {
     "rejected",
 }
 
+# Trade records included in the managed-position ledger.
 FILL_ORDER_STATUSES = {
     "filled",
     "partial_filled",
@@ -109,7 +125,8 @@ ALPACA_SECRET = required_env("ALPACA_SECRET_KEY")
 SUPABASE_URL = required_env("SUPABASE_URL")
 SUPABASE_KEY = required_env("SUPABASE_SERVICE_ROLE_KEY")
 
-# Paper trading is deliberately enforced.
+# SAFETY: paper=True is hardcoded.
+# Do not change this to live trading.
 trading = TradingClient(
     ALPACA_KEY,
     ALPACA_SECRET,
@@ -144,8 +161,19 @@ def finite_positive(value):
 
 
 def log_db(level, message, details=None):
+    """
+    Write an informational or error message to Supabase.
+
+    Expected bot_logs columns:
+      level
+      message
+      created_at
+
+    If the insert fails, the error remains visible in Render.
+    """
+
     try:
-        if details:
+        if details is not None:
             message = (
                 f"{message} | "
                 f"{json.dumps(details, default=str)}"
@@ -153,19 +181,21 @@ def log_db(level, message, details=None):
 
         supabase.table("bot_logs").insert({
             "level": str(level).upper(),
-            "message": str(message),
+            "message": str(message)[:8000],
             "created_at": utc_now(),
         }).execute()
 
     except Exception:
-        log.exception("Could not write message to bot_logs")
+        log.exception(
+            "Could not write message to bot_logs"
+        )
 
 
 def set_status(message, **extra):
     """
-    Update the bot status record.
+    Update bot_status.
 
-    The mode is always forced to paper.
+    Paper mode is always forced, regardless of extra arguments.
     """
 
     payload = {
@@ -178,7 +208,7 @@ def set_status(message, **extra):
 
     payload.update(extra)
 
-    # Never allow an extra argument to change trading mode.
+    # Prevent callers from changing the recorded mode.
     payload["mode"] = "paper"
 
     supabase.table("bot_status").upsert(
@@ -252,7 +282,6 @@ def latest_price(symbol):
     )
 
     response = market_data.get_stock_latest_trade(request)
-
     trade = response.get(symbol)
 
     if trade is None:
@@ -292,7 +321,8 @@ def calculate_rsi(close, period=RSI_PERIOD):
 
     rsi = 100 - (100 / (1 + relative_strength))
 
-    # Handle no-loss and no-movement cases safely.
+    # No losses means RSI is 100, unless there were also
+    # no gains or losses, in which case RSI is 50.
     rsi = rsi.where(avg_loss != 0, 100.0)
 
     no_gain_or_loss = (
@@ -306,8 +336,7 @@ def calculate_rsi(close, period=RSI_PERIOD):
 
 def get_signal(symbol):
     """
-    Original strategy:
-    BUY only when:
+    BUY when all conditions are true:
       - Last completed daily close > SMA20
       - SMA20 > SMA50
       - RSI is between 45 and 68
@@ -330,8 +359,6 @@ def get_signal(symbol):
                 "reason": "No historical price data"
             }
 
-        # yfinance may return MultiIndex columns even for
-        # a single ticker. Normalize them before use.
         if isinstance(frame.columns, pd.MultiIndex):
             frame.columns = frame.columns.get_level_values(0)
 
@@ -393,7 +420,10 @@ def get_signal(symbol):
         return "HOLD", info
 
     except Exception as exc:
-        log.exception("Signal calculation failed for %s", symbol)
+        log.exception(
+            "Signal calculation failed for %s",
+            symbol,
+        )
 
         return "HOLD", {
             "reason": str(exc)[:500]
@@ -421,7 +451,9 @@ def write_trade(
     total_value=None,
 ):
     """
-    Upsert using the unique order_id column.
+    Insert or update a trade using the unique order_id.
+
+    The trades table must have a unique constraint on order_id.
     """
 
     payload = {
@@ -464,10 +496,8 @@ def upsert_position(
     status,
 ):
     """
-    Update the most recent open position for this symbol,
-    or insert a new position if none exists.
-
-    This does not require a unique constraint on symbol.
+    Update the latest open position for this symbol,
+    or insert a position when none exists.
     """
 
     response = (
@@ -514,7 +544,6 @@ def upsert_position(
 
 def active_bot_positions():
     rows = get_position_rows()
-
     active = []
 
     for row in rows:
@@ -533,7 +562,10 @@ def active_bot_positions():
 
 
 def unresolved_status(status):
-    return str(status or "").lower() not in FINAL_ORDER_STATUSES
+    return (
+        str(status or "").lower()
+        not in FINAL_ORDER_STATUSES
+    )
 
 
 def has_unresolved_order(symbol=None):
@@ -595,7 +627,9 @@ def committed_value(positions):
 
     for position in positions:
         try:
-            quantity = float(position.get("quantity") or 0)
+            quantity = float(
+                position.get("quantity") or 0
+            )
 
             current_price = float(
                 position.get("current_price")
@@ -617,8 +651,8 @@ def committed_value(positions):
 
 def calculate_managed_position(trades, symbol):
     """
-    Calculate the bot-managed net long position and average
-    cost from recorded filled buy and sell orders.
+    Calculate bot-managed net long quantity and average cost
+    from trade records that contain actual fills.
     """
 
     symbol_trades = [
@@ -639,7 +673,9 @@ def calculate_managed_position(trades, symbol):
         side = str(row.get("side", "")).lower()
 
         try:
-            trade_quantity = float(row.get("quantity") or 0)
+            trade_quantity = float(
+                row.get("quantity") or 0
+            )
             price = float(row.get("price") or 0)
         except (TypeError, ValueError):
             continue
@@ -661,7 +697,10 @@ def calculate_managed_position(trades, symbol):
                 continue
 
             average_cost = cost_basis / quantity
-            sold_quantity = min(trade_quantity, quantity)
+            sold_quantity = min(
+                trade_quantity,
+                quantity,
+            )
 
             quantity -= sold_quantity
             cost_basis -= sold_quantity * average_cost
@@ -671,7 +710,9 @@ def calculate_managed_position(trades, symbol):
                 cost_basis = 0.0
 
     average_cost = (
-        cost_basis / quantity if quantity > 0 else 0.0
+        cost_basis / quantity
+        if quantity > 0
+        else 0.0
     )
 
     return quantity, average_cost
@@ -679,8 +720,11 @@ def calculate_managed_position(trades, symbol):
 
 def sync_position_from_broker(symbol):
     """
-    Rebuild the bot-managed position from the trade ledger.
+    Rebuild a bot-managed position from the trade ledger.
+
     Unknown broker holdings are not automatically adopted.
+    A mismatch raises an error rather than silently creating
+    a position from assumptions.
     """
 
     trades = get_trade_rows()
@@ -745,8 +789,15 @@ def sync_position_from_broker(symbol):
 
 def reconcile_orders():
     """
-    Reconcile pending orders with Alpaca by client order ID.
-    Never resubmit an order just because its result is unclear.
+    Reconcile recorded orders with Alpaca.
+
+    Orders are not automatically resubmitted when a response
+    is missing or ambiguous.
+
+    Filled quantities are recorded separately from requested
+    quantities. A terminal order with a partial fill is recorded
+    as synced only after its actual filled quantity and price
+    are available.
     """
 
     rows = get_trade_rows()
@@ -775,20 +826,54 @@ def reconcile_orders():
                 client_order_id,
                 exc,
             )
+
+            log_db(
+                "WARNING",
+                "Order reconciliation deferred",
+                {
+                    "order_id": client_order_id,
+                    "error": str(exc)[:500],
+                },
+            )
+
             continue
 
         broker_status = order_status(order)
 
-        filled_quantity = float(
-            getattr(order, "filled_qty", 0) or 0
+        try:
+            filled_quantity = float(
+                getattr(order, "filled_qty", 0) or 0
+            )
+
+            filled_price = float(
+                getattr(order, "filled_avg_price", 0) or 0
+            )
+        except (TypeError, ValueError):
+            filled_quantity = 0.0
+            filled_price = 0.0
+
+        has_fill = (
+            math.isfinite(filled_quantity)
+            and math.isfinite(filled_price)
+            and filled_quantity > 0
+            and filled_price > 0
         )
 
-        filled_price = float(
-            getattr(order, "filled_avg_price", 0) or 0
+        terminal = (
+            broker_status in BROKER_TERMINAL_STATUSES
         )
 
-        if filled_quantity > 0 and filled_price > 0:
-            total_value = filled_quantity * filled_price
+        if has_fill:
+            total_value = (
+                filled_quantity * filled_price
+            )
+
+            # For a terminal order with a fill, retain the
+            # actual filled quantity and price. A partially
+            # filled cancellation still represents a real fill.
+            record_status = (
+                "synced" if terminal else broker_status
+            )
 
             write_trade(
                 order_id=client_order_id,
@@ -796,30 +881,35 @@ def reconcile_orders():
                 side=row.get("side"),
                 quantity=filled_quantity,
                 price=filled_price,
-                status=broker_status,
+                status=record_status,
                 strategy=row.get("strategy", ""),
-                reason=row.get("reason", ""),
+                reason=(
+                    f"{row.get('reason', '')}; "
+                    f"broker_status={broker_status}"
+                ),
                 total_value=total_value,
             )
 
-            if broker_status in FINAL_ORDER_STATUSES:
+            if terminal:
                 sync_position_from_broker(
                     row.get("symbol")
                 )
 
-                write_trade(
-                    order_id=client_order_id,
-                    symbol=row.get("symbol"),
-                    side=row.get("side"),
-                    quantity=filled_quantity,
-                    price=filled_price,
-                    status="synced",
-                    strategy=row.get("strategy", ""),
-                    reason=row.get("reason", ""),
-                    total_value=total_value,
+                log_db(
+                    "INFO",
+                    "Terminal order reconciled",
+                    {
+                        "order_id": client_order_id,
+                        "symbol": row.get("symbol"),
+                        "broker_status": broker_status,
+                        "filled_quantity": filled_quantity,
+                        "filled_price": filled_price,
+                    },
                 )
 
         else:
+            # No confirmed fill: preserve the order's broker
+            # status and requested quantity for later review.
             write_trade(
                 order_id=client_order_id,
                 symbol=row.get("symbol"),
@@ -832,6 +922,17 @@ def reconcile_orders():
                 total_value=row.get("total_value"),
             )
 
+            if terminal:
+                log_db(
+                    "INFO",
+                    "Terminal order has no confirmed fill",
+                    {
+                        "order_id": client_order_id,
+                        "symbol": row.get("symbol"),
+                        "broker_status": broker_status,
+                    },
+                )
+
 
 # ============================================================
 # ORDER PLACEMENT
@@ -839,8 +940,10 @@ def reconcile_orders():
 
 def place_market_order(symbol, side, qty, reason):
     """
-    Record order intent before submission. If submission has
-    an ambiguous result, do not automatically retry it.
+    Record order intent before submitting it.
+
+    If submission returns an ambiguous result, do not
+    automatically retry the order.
     """
 
     if not isinstance(qty, int) or qty < 1:
@@ -861,6 +964,8 @@ def place_market_order(symbol, side, qty, reason):
         f"{uuid.uuid4().hex[:20]}"
     )
 
+    # Record intent before submission so an uncertain result
+    # can be reconciled by client_order_id.
     write_trade(
         order_id=client_order_id,
         symbol=symbol,
@@ -881,7 +986,9 @@ def place_market_order(symbol, side, qty, reason):
     )
 
     try:
-        order = trading.submit_order(order_data=request)
+        order = trading.submit_order(
+            order_data=request
+        )
 
     except Exception as exc:
         log.exception(
@@ -896,7 +1003,7 @@ def place_market_order(symbol, side, qty, reason):
             {
                 "symbol": symbol,
                 "client_order_id": client_order_id,
-                "error": str(exc),
+                "error": str(exc)[:500],
             },
         )
 
@@ -926,6 +1033,18 @@ def place_market_order(symbol, side, qty, reason):
         broker_status,
     )
 
+    log_db(
+        "INFO",
+        "Order submitted",
+        {
+            "order_id": client_order_id,
+            "symbol": symbol,
+            "side": side.value,
+            "quantity": qty,
+            "status": broker_status,
+        },
+    )
+
     return order
 
 
@@ -950,16 +1069,22 @@ def manage_exits():
             continue
 
         try:
-            quantity = int(
-                float(position.get("quantity") or 0)
+            quantity_value = float(
+                position.get("quantity") or 0
             )
 
             entry_price = float(
                 position.get("entry_price") or 0
             )
 
-            if quantity < 1 or not finite_positive(entry_price):
+            if (
+                not math.isfinite(quantity_value)
+                or quantity_value < 1
+                or not finite_positive(entry_price)
+            ):
                 continue
+
+            quantity = int(quantity_value)
 
             price = latest_price(symbol)
 
@@ -969,7 +1094,7 @@ def manage_exits():
 
             if profit_percent <= -STOP_LOSS_PERCENT:
                 reason = (
-                    f"Stop-loss triggered: "
+                    f"Stop-loss trigger observed: "
                     f"{profit_percent:.2%} return"
                 )
 
@@ -987,7 +1112,7 @@ def manage_exits():
 
             elif profit_percent >= TAKE_PROFIT_PERCENT:
                 reason = (
-                    f"Take-profit triggered: "
+                    f"Take-profit trigger observed: "
                     f"{profit_percent:.2%} return"
                 )
 
@@ -1020,7 +1145,7 @@ def manage_exits():
                 "Exit management failed",
                 {
                     "symbol": symbol,
-                    "error": str(exc),
+                    "error": str(exc)[:500],
                 },
             )
 
@@ -1069,10 +1194,8 @@ def scan_once():
     """
     Run one worker cycle.
 
-    PATCH:
-    Update last_scan and last_heartbeat immediately so the
-    dashboard shows the worker is checking in even when the
-    bot is paused or the market is closed.
+    Update heartbeat and last_scan at cycle start.
+    Keep the bot paused unless Supabase explicitly enables it.
     """
 
     cycle_time = utc_now()
@@ -1092,30 +1215,52 @@ def scan_once():
 
     config = get_bot_config()
 
+    # FIX: Record paused status in Supabase as well as Render.
     if config.get("enabled") is not True:
+        message = "Paused: bot_status.enabled is not true"
+
         set_status(
-            "Paused: bot_status.enabled is not true",
+            message,
             last_scan=cycle_time,
             mode="paper",
         )
 
-        log.info("Bot disabled in Supabase")
+        log.info(message)
+
+        log_db(
+            "INFO",
+            message,
+            {
+                "enabled": config.get("enabled"),
+                "mode": "paper",
+                "last_scan": cycle_time,
+            },
+        )
+
         return
 
+    # SAFETY: This worker never permits live trading.
     if (
         not PAPER_MODE
         or str(config.get("mode", "paper")).lower() != "paper"
     ):
+        message = (
+            "SAFETY STOP: only paper trading is permitted"
+        )
+
         set_status(
-            "SAFETY STOP: only paper trading is permitted",
+            message,
             last_scan=cycle_time,
             mode="paper",
         )
+
+        log_db("ERROR", message)
 
         raise RuntimeError(
             "Live trading is disabled by this worker"
         )
 
+    # Reconcile existing orders before considering new ones.
     reconcile_orders()
 
     try:
@@ -1124,34 +1269,56 @@ def scan_once():
         broker_positions = broker_positions_by_symbol()
 
     except Exception as exc:
+        message = (
+            "Safety stop: broker/account check failed: "
+            f"{str(exc)[:400]}"
+        )
+
         set_status(
-            f"Safety stop: broker/account check failed: "
-            f"{str(exc)[:500]}",
+            message,
             last_scan=cycle_time,
             mode="paper",
         )
 
         log.exception("Broker safety check failed")
+
+        log_db(
+            "ERROR",
+            message,
+            {"error": str(exc)[:500]},
+        )
+
         return
 
     if not clock.is_open:
+        message = "Waiting: market is closed"
+
         set_status(
-            "Waiting: market is closed",
+            message,
             last_scan=cycle_time,
             mode="paper",
         )
 
-        log.info("Market is closed; no trades submitted")
+        log.info(message)
+        log_db("INFO", message)
+
         return
 
     manage_exits()
 
     if has_unresolved_order():
+        message = (
+            "Waiting: unresolved order requires reconciliation"
+        )
+
         set_status(
-            "Waiting: unresolved order requires reconciliation",
+            message,
             last_scan=cycle_time,
             mode="paper",
         )
+
+        log_db("WARNING", message)
+
         return
 
     for symbol in WATCHLIST:
@@ -1228,9 +1395,12 @@ def scan_once():
                 getattr(account, "buying_power", 0) or 0
             )
 
-            if not math.isfinite(buying_power):
+            if (
+                not math.isfinite(buying_power)
+                or buying_power <= 0
+            ):
                 log.warning(
-                    "%s: invalid broker buying power",
+                    "%s: invalid or unavailable broker buying power",
                     symbol,
                 )
                 continue
@@ -1272,6 +1442,14 @@ def scan_once():
                 )
                 continue
 
+            if estimated_value > remaining_budget:
+                log.info(
+                    "%s: skipped because virtual budget "
+                    "would be exceeded",
+                    symbol,
+                )
+                continue
+
             if has_unresolved_order():
                 log.warning(
                     "Unresolved order detected; ending scan"
@@ -1302,8 +1480,7 @@ def scan_once():
                 price_now,
             )
 
-            # Preserve original behavior: at most one new
-            # buy order per scan.
+            # At most one new buy order per scan.
             break
 
         except Exception as exc:
@@ -1317,18 +1494,27 @@ def scan_once():
                 "Symbol scan failed",
                 {
                     "symbol": symbol,
-                    "error": str(exc),
+                    "error": str(exc)[:500],
                 },
             )
 
-            # Do not keep submitting new orders after an
-            # order-related or data-related exception.
+            # Stop the scan after any order/data exception.
             break
 
     set_status(
         "Scan completed",
         last_scan=cycle_time,
         mode="paper",
+    )
+
+    log_db(
+        "INFO",
+        "Scan completed",
+        {
+            "watchlist_count": len(WATCHLIST),
+            "last_scan": cycle_time,
+            "mode": "paper",
+        },
     )
 
 
@@ -1348,6 +1534,17 @@ def main():
         SCAN_INTERVAL_SECONDS,
     )
 
+    log_db(
+        "INFO",
+        "Paper worker started; trading remains controlled "
+        "by bot_status.enabled",
+        {
+            "mode": "paper",
+            "scan_interval_seconds": SCAN_INTERVAL_SECONDS,
+            "watchlist_count": len(WATCHLIST),
+        },
+    )
+
     while True:
         try:
             scan_once()
@@ -1358,12 +1555,12 @@ def main():
             log_db(
                 "ERROR",
                 "Scan cycle failed",
-                {"error": str(exc)},
+                {"error": str(exc)[:500]},
             )
 
             try:
                 set_status(
-                    f"Scan cycle error: {str(exc)[:800]}",
+                    f"Scan cycle error: {str(exc)[:700]}",
                     last_scan=utc_now(),
                     mode="paper",
                 )
