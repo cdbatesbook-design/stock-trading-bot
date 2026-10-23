@@ -194,3 +194,5 @@ if st.session_state.get("analyze", False):
 
         except Exception as e:
             st.error(f"Analysis failed: {e}")
+
+
