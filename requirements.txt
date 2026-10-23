@@ -1,5 +1,8 @@
+
 streamlit
 yfinance
 pandas
 numpy
 requests
+alpaca-py
+supabase
