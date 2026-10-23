@@ -169,7 +169,6 @@ if st.session_state.get("analyze", False):
             else:
                 st.info("No clear moving-average trend.")
 
-            st.caption(
                             st.caption(
                 "Signals are based on historical prices and moving averages. "
                 "They do not predict future returns."
