@@ -28,7 +28,8 @@ logger = logging.getLogger("autotrader")
 # Risk settings
 VIRTUAL_BUDGET = 10000.00
 MAX_POSITION_VALUE = 900.00
-MAX_OPEN_POSITIONS = 5
+
+= 5
 
 STOP_LOSS_PERCENT = 0.03
 TAKE_PROFIT_PERCENT = 0.06
