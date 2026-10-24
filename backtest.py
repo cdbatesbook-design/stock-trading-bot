@@ -1,6 +1,7 @@
 import os
 import time
 import logging
+import uuid
 from datetime import datetime, timedelta, timezone, time as dt_time
 from zoneinfo import ZoneInfo
 
@@ -23,33 +24,39 @@ SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 EASTERN = ZoneInfo("America/New_York")
 
 BACKTEST_DAYS = 180
+DAILY_WARMUP_DAYS = 150
+
 MAX_SYMBOLS = 100
 SYMBOL_BATCH_SIZE = 10
-DAILY_BATCH_SIZE = 200
+DAILY_BATCH_SIZE = 100
 
 STARTING_CAPITALS = [500, 1000, 2500, 5000]
-STRATEGIES = [5, 15, 30]
+
+ORB_STRATEGIES = [5, 15, 30]
 
 MAX_POSITIONS = 3
 
-# Risk no more than 1% of current equity per trade.
-RISK_PER_TRADE = 0.01
+RISK_PER_TRADE = 0.005
+MAX_POSITION_EQUITY_PCT = 0.30
 
-# Limit each position to 33% of current equity.
-MAX_POSITION_EQUITY_PCT = 0.33
-
-# Simulated slippage, applied on both entry and exit.
 SLIPPAGE_BPS = 5
-
-# Target is 2 times the entry-to-stop risk.
 REWARD_RISK_RATIO = 2.0
 
-# Stock must be at least $5 and have sufficient liquidity.
 MIN_STOCK_PRICE = 5.00
 MIN_AVG_DOLLAR_VOLUME = 20_000_000
 
-# Alpaca IEX historical data feed.
+MAX_ENTRY_GAP_PCT = 0.03
+
 DATA_FEED = "iex"
+
+# Four momentum configurations:
+# (name, breakout lookback, volume multiplier, ATR stop multiplier)
+MOMENTUM_CONFIGS = [
+    ("MOM_20D_VOL15_ATR2", 20, 1.5, 2.0),
+    ("MOM_20D_VOL10_ATR2", 20, 1.0, 2.0),
+    ("MOM_55D_VOL15_ATR2", 55, 1.5, 2.0),
+    ("MOM_20D_VOL15_ATR3", 20, 1.5, 3.0),
+]
 
 LOG_LEVEL = logging.INFO
 
@@ -132,6 +139,13 @@ def chunks(items, size):
         yield items[start:start + size]
 
 
+def safe_float(value, default=0.0):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 # ============================================================
 # ALPACA ASSET UNIVERSE
 # ============================================================
@@ -158,7 +172,6 @@ def discover_symbols():
 
         symbol = asset.get("symbol", "")
 
-        # Exclude unusual symbol formats and OTC-style symbols.
         if not symbol or len(symbol) > 6:
             continue
 
@@ -182,15 +195,6 @@ def discover_symbols():
 # ============================================================
 
 def download_bars(symbols, timeframe, start, end):
-    """
-    Downloads all available pages for the requested symbols.
-
-    Returns:
-        {symbol: [bar, bar, ...]}
-
-    Each bar includes its actual timestamp and OHLCV values.
-    """
-
     if not symbols:
         return {}
 
@@ -226,10 +230,8 @@ def download_bars(symbols, timeframe, start, end):
         bars_by_symbol = payload.get("bars") or {}
 
         for symbol, rows in bars_by_symbol.items():
-            if symbol not in collected:
-                continue
-
-            collected[symbol].extend(rows)
+            if symbol in collected:
+                collected[symbol].extend(rows)
 
         page_token = payload.get("next_page_token")
 
@@ -256,11 +258,15 @@ def download_bars(symbols, timeframe, start, end):
 # ============================================================
 
 def screen_universe(symbols, start, end):
-    log.info("Screening symbols using daily historical bars.")
+    log.info("Screening stocks for price and liquidity.")
 
     candidates = []
+    total = len(symbols)
 
-    for batch in chunks(symbols, DAILY_BATCH_SIZE):
+    for batch_number, batch in enumerate(
+        chunks(symbols, DAILY_BATCH_SIZE),
+        start=1,
+    ):
         daily = download_bars(
             batch,
             "1Day",
@@ -273,14 +279,14 @@ def screen_universe(symbols, start, end):
                 continue
 
             recent = rows[-20:]
-
-            last_close = float(recent[-1]["c"])
+            last_close = safe_float(recent[-1].get("c"))
 
             if last_close < MIN_STOCK_PRICE:
                 continue
 
             dollar_volumes = [
-                float(row["c"]) * float(row["v"])
+                safe_float(row.get("c"))
+                * safe_float(row.get("v"))
                 for row in recent
             ]
 
@@ -298,13 +304,9 @@ def screen_universe(symbols, start, end):
             })
 
         log.info(
-            "Daily screening progress: %s/%s symbols; "
-            "%s currently qualify.",
-            min(
-                symbols.index(batch[-1]) + 1,
-                len(symbols),
-            ) if batch else 0,
-            len(symbols),
+            "Screening batch %s complete. "
+            "%s candidates qualify so far.",
+            batch_number,
             len(candidates),
         )
 
@@ -316,16 +318,15 @@ def screen_universe(symbols, start, end):
     selected = candidates[:MAX_SYMBOLS]
 
     log.info(
-        "%s symbols passed the liquidity screen; "
-        "selecting the top %s.",
+        "%s stocks passed the liquidity screen; "
+        "selected %s.",
         len(candidates),
         len(selected),
     )
 
     for item in selected[:20]:
         log.info(
-            "Candidate: %s price=$%.2f average daily "
-            "dollar volume=$%.0f",
+            "Selected %s: price=$%.2f, average dollar volume=$%.0f",
             item["symbol"],
             item["price"],
             item["avg_dollar_volume"],
@@ -335,17 +336,10 @@ def screen_universe(symbols, start, end):
 
 
 # ============================================================
-# REGULAR-SESSION MINUTE BARS
+# MINUTE BARS: REGULAR SESSION
 # ============================================================
 
 def regular_session_by_day(rows):
-    """
-    Groups minute bars by Eastern trading date.
-
-    Only regular-session bars from 9:30 AM through
-    3:59 PM Eastern are included.
-    """
-
     by_day = {}
 
     for row in rows:
@@ -367,11 +361,11 @@ def regular_session_by_day(rows):
         by_day.setdefault(day, []).append({
             "timestamp": timestamp,
             "local": local,
-            "open": float(row["o"]),
-            "high": float(row["h"]),
-            "low": float(row["l"]),
-            "close": float(row["c"]),
-            "volume": float(row["v"]),
+            "open": safe_float(row.get("o")),
+            "high": safe_float(row.get("h")),
+            "low": safe_float(row.get("l")),
+            "close": safe_float(row.get("c")),
+            "volume": safe_float(row.get("v")),
         })
 
     for day in by_day:
@@ -383,27 +377,10 @@ def regular_session_by_day(rows):
 
 
 # ============================================================
-# OPENING-RANGE BREAKOUT CANDIDATES
+# OPENING-RANGE BREAKOUT
 # ============================================================
 
-def generate_candidates(symbol, rows, opening_minutes):
-    """
-    Long-only opening-range breakout.
-
-    Rules:
-      1. Calculate the opening range using the first N bars.
-      2. Signal when a later bar closes above the range high.
-      3. Enter at the NEXT bar's open.
-      4. Stop at the opening-range low.
-      5. Target at 2R.
-      6. If stop and target are touched in the same bar,
-         assume the stop was hit first.
-      7. If neither is hit, exit at the final regular-session
-         bar's close.
-
-    Entry and exit timestamps are actual bar timestamps.
-    """
-
+def generate_orb_candidates(symbol, rows, opening_minutes):
     candidates = []
     days = regular_session_by_day(rows)
 
@@ -424,11 +401,12 @@ def generate_candidates(symbol, rows, opening_minutes):
         if range_high <= range_low:
             continue
 
-        # The opening range must finish before a breakout
-        # can be signaled.
         signal_index = None
 
-        for index in range(opening_minutes, len(bars) - 1):
+        for index in range(
+            opening_minutes,
+            len(bars) - 1,
+        ):
             if bars[index]["close"] > range_high:
                 signal_index = index
                 break
@@ -436,9 +414,7 @@ def generate_candidates(symbol, rows, opening_minutes):
         if signal_index is None:
             continue
 
-        entry_index = signal_index + 1
-        entry_bar = bars[entry_index]
-
+        entry_bar = bars[signal_index + 1]
         raw_entry = entry_bar["open"]
         raw_stop = range_low
 
@@ -456,10 +432,9 @@ def generate_candidates(symbol, rows, opening_minutes):
         exit_timestamp = None
         exit_reason = None
 
-        for index in range(entry_index, len(bars)):
+        for index in range(signal_index + 1, len(bars)):
             bar = bars[index]
 
-            # Handle gaps through stop/target levels.
             if bar["open"] <= raw_stop:
                 exit_price = bar["open"]
                 exit_timestamp = bar["timestamp"]
@@ -475,8 +450,6 @@ def generate_candidates(symbol, rows, opening_minutes):
             hit_stop = bar["low"] <= raw_stop
             hit_target = bar["high"] >= target
 
-            # Conservative assumption when intrabar order
-            # cannot be determined from one-minute OHLC data.
             if hit_stop and hit_target:
                 exit_price = raw_stop
                 exit_timestamp = bar["timestamp"]
@@ -501,9 +474,6 @@ def generate_candidates(symbol, rows, opening_minutes):
             exit_timestamp = last_bar["timestamp"]
             exit_reason = "SESSION_CLOSE"
 
-        if exit_timestamp < entry_bar["timestamp"]:
-            continue
-
         candidates.append({
             "symbol": symbol,
             "trading_day": str(trading_day),
@@ -514,492 +484,308 @@ def generate_candidates(symbol, rows, opening_minutes):
             "stop_price": raw_stop,
             "target_price": target,
             "exit_reason": exit_reason,
-            "opening_minutes": opening_minutes,
+            "strategy_type": f"ORB_{opening_minutes}M",
         })
 
     return candidates
 
 
 # ============================================================
-# PORTFOLIO SIMULATION
+# DAILY BARS: PREPARE INDICATORS
 # ============================================================
 
-def simulate_portfolio(candidates, starting_capital):
+def prepare_daily_bars(rows):
     """
-    Simulates one strategy/account combination.
+    Adds moving averages, volume average, ATR, and returns.
 
-    Constraints:
-      - At most three simultaneous positions.
-      - Risk-based position sizing.
-      - No borrowing or negative cash.
-      - Fractional shares are allowed in the simulation.
-      - Slippage is applied on entry and exit.
-      - Positions are closed using their actual exit times.
+    All indicators at index i use data available by the
+    close of bar i. Entries are scheduled for the next
+    available session's open.
     """
 
-    slippage = SLIPPAGE_BPS / 10000.0
+    prepared = []
 
-    candidates = sorted(
-        candidates,
-        key=lambda trade: (
-            trade["entry_time"],
-            trade["symbol"],
-        ),
-    )
+    for index, row in enumerate(rows):
+        bar = {
+            "timestamp": parse_timestamp(row["t"]),
+            "date": parse_timestamp(row["t"]).astimezone(
+                EASTERN
+            ).date(),
+            "open": safe_float(row.get("o")),
+            "high": safe_float(row.get("h")),
+            "low": safe_float(row.get("l")),
+            "close": safe_float(row.get("c")),
+            "volume": safe_float(row.get("v")),
+        }
 
-    cash = float(starting_capital)
-    active = []
-    closed_trades = []
-    skipped = 0
+        if index >= 19:
+            last20 = rows[index - 19:index + 1]
 
-    equity_curve = [float(starting_capital)]
+            bar["ma20"] = sum(
+                safe_float(item.get("c"))
+                for item in last20
+            ) / 20
 
-    def close_position(position):
-        nonlocal cash
+        if index >= 49:
+            last50 = rows[index - 49:index + 1]
 
-        cash += (
-            position["shares"]
-            * position["effective_exit"]
-        )
+            bar["ma50"] = sum(
+                safe_float(item.get("c"))
+                for item in last50
+            ) / 50
 
-        closed_trades.append({
-            "symbol": position["symbol"],
-            "entry_time": position["entry_time"],
-            "exit_time": position["exit_time"],
-            "shares": position["shares"],
-            "entry_price": position["effective_entry"],
-            "exit_price": position["effective_exit"],
-            "pnl": position["pnl"],
-            "exit_reason": position["exit_reason"],
-        })
+        if index >= 20:
+            prior20 = rows[index - 20:index]
 
-        equity_curve.append(cash)
-
-    for trade in candidates:
-        entry_time = trade["entry_time"]
-
-        # Close every position whose actual exit time has
-        # arrived before processing this entry.
-        still_active = []
-
-        for position in active:
-            if position["exit_time"] <= entry_time:
-                close_position(position)
-            else:
-                still_active.append(position)
-
-        active = still_active
-
-        # Reject a new trade if three positions are open.
-        if len(active) >= MAX_POSITIONS:
-            skipped += 1
-            continue
-
-        effective_entry = (
-            trade["entry_price"] * (1 + slippage)
-        )
-
-        effective_exit = (
-            trade["exit_price"] * (1 - slippage)
-        )
-
-        effective_stop = (
-            trade["stop_price"] * (1 - slippage)
-        )
-
-        risk_per_share = (
-            effective_entry - effective_stop
-        )
-
-        if (
-            effective_entry <= 0
-            or risk_per_share <= 0
-            or cash <= 0
-        ):
-            skipped += 1
-            continue
-
-        # Equity is cash plus the entry cost of currently
-        # open positions. Unrealized gains are not assumed.
-        equity = cash + sum(
-            position["shares"]
-            * position["effective_entry"]
-            for position in active
-        )
-
-        risk_budget = equity * RISK_PER_TRADE
-
-        max_position_value = (
-            equity * MAX_POSITION_EQUITY_PCT
-        )
-
-        shares_by_risk = (
-            risk_budget / risk_per_share
-        )
-
-        shares_by_position_limit = (
-            max_position_value / effective_entry
-        )
-
-        shares_by_cash = cash / effective_entry
-
-        shares = min(
-            shares_by_risk,
-            shares_by_position_limit,
-            shares_by_cash,
-        )
-
-        if shares <= 0.000001:
-            skipped += 1
-            continue
-
-        cost = shares * effective_entry
-
-        if cost > cash + 0.000001:
-            skipped += 1
-            continue
-
-        cash -= cost
-
-        estimated_pnl = shares * (
-            effective_exit - effective_entry
-        )
-
-        active.append({
-            "symbol": trade["symbol"],
-            "entry_time": entry_time,
-            "exit_time": trade["exit_time"],
-            "shares": shares,
-            "effective_entry": effective_entry,
-            "effective_exit": effective_exit,
-            "pnl": estimated_pnl,
-            "exit_reason": trade["exit_reason"],
-        })
-
-    # Close remaining positions in actual exit-time order.
-    active.sort(key=lambda position: position["exit_time"])
-
-    for position in active:
-        close_position(position)
-
-    ending_equity = cash
-
-    profits = [
-        trade["pnl"]
-        for trade in closed_trades
-        if trade["pnl"] > 0
-    ]
-
-    losses = [
-        trade["pnl"]
-        for trade in closed_trades
-        if trade["pnl"] < 0
-    ]
-
-    wins = len(profits)
-    losing_trades = len(losses)
-    trade_count = len(closed_trades)
-
-    win_rate = (
-        wins / trade_count * 100
-        if trade_count
-        else 0.0
-    )
-
-    gross_profit = sum(profits)
-    gross_loss = abs(sum(losses))
-
-    if gross_loss > 0:
-        profit_factor = gross_profit / gross_loss
-    elif gross_profit > 0:
-        profit_factor = None
-    else:
-        profit_factor = 0.0
-
-    net_profit = ending_equity - starting_capital
-
-    return_pct = (
-        net_profit / starting_capital * 100
-        if starting_capital
-        else 0.0
-    )
-
-    # Drawdown calculated from the closed-trade equity curve.
-    # It does not capture every unrealized intratrade decline.
-    peak = equity_curve[0]
-    max_drawdown = 0.0
-
-    for equity in equity_curve:
-        peak = max(peak, equity)
-
-        if peak > 0:
-            drawdown = (peak - equity) / peak * 100
-            max_drawdown = max(
-                max_drawdown,
-                drawdown,
+            bar["prior20_high"] = max(
+                safe_float(item.get("h"))
+                for item in prior20
             )
 
-    return {
-        "starting_capital": round(starting_capital, 2),
-        "ending_equity": round(ending_equity, 2),
-        "net_profit": round(net_profit, 2),
-        "return_pct": round(return_pct, 2),
-        "trades": trade_count,
-        "wins": wins,
-        "losses": losing_trades,
-        "win_rate": round(win_rate, 2),
-        "profit_factor": (
-            round(profit_factor, 4)
-            if profit_factor is not None
-            else None
-        ),
-        "max_drawdown_pct": round(max_drawdown, 2),
-        "skipped_trades": skipped,
-        "closed_trades": closed_trades,
-    }
+            bar["prior20_volume_avg"] = sum(
+                safe_float(item.get("v"))
+                for item in prior20
+            ) / 20
 
-
-# ============================================================
-# SUPABASE RESULTS
-# ============================================================
-
-def save_result(strategy, result, start_date, end_date):
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        log.warning(
-            "Supabase credentials missing; result not saved."
-        )
-        return
-
-    payload = {
-        "strategy": strategy,
-        "starting_capital": result["starting_capital"],
-        "ending_equity": result["ending_equity"],
-        "net_profit": result["net_profit"],
-        "return_pct": result["return_pct"],
-        "trades": result["trades"],
-        "wins": result["wins"],
-        "losses": result["losses"],
-        "win_rate": result["win_rate"],
-        "profit_factor": result["profit_factor"],
-        "max_drawdown_pct": result["max_drawdown_pct"],
-        "skipped_trades": result["skipped_trades"],
-        "start_date": start_date,
-        "end_date": end_date,
-    }
-
-    headers = {
-        "apikey": SUPABASE_KEY,
-        "Authorization": f"Bearer {SUPABASE_KEY}",
-        "Content-Type": "application/json",
-        "Prefer": "return=minimal",
-    }
-
-    try:
-        response = SESSION.post(
-            f"{SUPABASE_URL}/rest/v1/backtest_results",
-            json=payload,
-            headers=headers,
-            timeout=30,
-        )
-
-        if response.status_code >= 300:
-            log.error(
-                "Supabase save failed: %s %s",
-                response.status_code,
-                response.text[:1000],
-            )
-        else:
-            log.info(
-                "Saved %s result for $%.0f.",
-                strategy,
-                result["starting_capital"],
+            prior_close = safe_float(
+                rows[index - 20].get("c")
             )
 
-    except requests.RequestException as exc:
-        log.error("Supabase request failed: %s", exc)
+            if prior_close > 0:
+                bar["return20"] = (
+                    bar["close"] / prior_close
+                ) - 1
 
+        if index >= 55:
+            prior55 = rows[index - 55:index]
 
-# ============================================================
-# REPORTING
-# ============================================================
+            bar["prior55_high"] = max(
+                safe_float(item.get("h"))
+                for item in prior55
+            )
 
-def report_result(strategy, result):
-    log.info("=" * 65)
-    log.info("STRATEGY: %s", strategy)
-    log.info(
-        "STARTING CAPITAL: $%.2f",
-        result["starting_capital"],
-    )
-    log.info(
-        "ENDING EQUITY: $%.2f",
-        result["ending_equity"],
-    )
-    log.info(
-        "NET PROFIT: $%.2f",
-        result["net_profit"],
-    )
-    log.info(
-        "RETURN: %.2f%%",
-        result["return_pct"],
-    )
-    log.info("TRADES: %s", result["trades"])
-    log.info("WINS: %s", result["wins"])
-    log.info("LOSSES: %s", result["losses"])
-    log.info("WIN RATE: %.2f%%", result["win_rate"])
+        if index >= 14:
+            true_ranges = []
 
-    pf = result["profit_factor"]
+            for j in range(index - 13, index + 1):
+                current = rows[j]
 
-    if pf is None:
-        log.info("PROFIT FACTOR: Undefined (no losing trades)")
-    else:
-        log.info("PROFIT FACTOR: %.4f", pf)
+                high = safe_float(current.get("h"))
+                low = safe_float(current.get("l"))
 
-    log.info(
-        "CLOSED-TRADE MAX DRAWDOWN: %.2f%%",
-        result["max_drawdown_pct"],
-    )
-    log.info(
-        "SKIPPED TRADES: %s",
-        result["skipped_trades"],
-    )
-    log.info("=" * 65)
-
-
-# ============================================================
-# MAIN
-# ============================================================
-
-def main():
-    now = datetime.now(timezone.utc)
-
-    # End at today's UTC midnight to avoid using a partial
-    # current trading session.
-    end = now.replace(
-        hour=0,
-        minute=0,
-        second=0,
-        microsecond=0,
-    )
-
-    start = end - timedelta(days=BACKTEST_DAYS)
-
-    log.info("Historical backtest starting.")
-    log.info("Start date: %s", start.date())
-    log.info("End date: %s", end.date())
-    log.info("Maximum simultaneous positions: %s", MAX_POSITIONS)
-    log.info("Capital buckets: %s", STARTING_CAPITALS)
-    log.info("Strategies: %s", STRATEGIES)
-    log.info("Slippage per side: %s basis points", SLIPPAGE_BPS)
-    log.info("Risk per trade: %.2f%%", RISK_PER_TRADE * 100)
-
-    symbols = discover_symbols()
-
-    if not symbols:
-        raise RuntimeError("No eligible Alpaca symbols discovered.")
-
-    selected_symbols = screen_universe(
-        symbols,
-        start,
-        end,
-    )
-
-    if not selected_symbols:
-        raise RuntimeError(
-            "No stocks passed the liquidity screen."
-        )
-
-    all_candidates = {
-        minutes: []
-        for minutes in STRATEGIES
-    }
-
-    total_bars = 0
-
-    log.info(
-        "Downloading minute bars for %s selected stocks.",
-        len(selected_symbols),
-    )
-
-    # Process small batches to limit memory consumption.
-    for batch_number, batch in enumerate(
-        chunks(selected_symbols, SYMBOL_BATCH_SIZE),
-        start=1,
-    ):
-        log.info(
-            "Minute-data batch %s: %s symbols.",
-            batch_number,
-            len(batch),
-        )
-
-        minute_data = download_bars(
-            batch,
-            "1Min",
-            start,
-            end,
-        )
-
-        for symbol, rows in minute_data.items():
-            total_bars += len(rows)
-
-            if not rows:
-                continue
-
-            for minutes in STRATEGIES:
-                trades = generate_candidates(
-                    symbol,
-                    rows,
-                    minutes,
+                previous_close = safe_float(
+                    rows[j - 1].get("c")
+                ) if j > 0 else safe_float(
+                    current.get("c")
                 )
 
-                all_candidates[minutes].extend(trades)
+                true_range = max(
+                    high - low,
+                    abs(high - previous_close),
+                    abs(low - previous_close),
+                )
 
-        log.info(
-            "Minute bars downloaded so far: %s",
-            total_bars,
-        )
+                true_ranges.append(true_range)
 
-        # Release references before moving to the next batch.
-        del minute_data
-
-    log.info(
-        "Total minute bars downloaded: %s",
-        total_bars,
-    )
-
-    start_date = start.date().isoformat()
-    end_date = end.date().isoformat()
-
-    for minutes in STRATEGIES:
-        strategy = f"ORB_{minutes}M"
-        candidates = all_candidates[minutes]
-
-        log.info(
-            "%s generated %s trade candidates.",
-            strategy,
-            len(candidates),
-        )
-
-        for capital in STARTING_CAPITALS:
-            result = simulate_portfolio(
-                candidates,
-                capital,
+            bar["atr14"] = (
+                sum(true_ranges) / len(true_ranges)
             )
 
-            report_result(strategy, result)
+        prepared.append(bar)
 
-            save_result(
-                strategy,
-                result,
-                start_date,
-                end_date,
-            )
+    return prepared
 
-    log.info("All backtests completed.")
-    log.info(
-        "WARNING: These are historical simulations, not "
-        "evidence of future profitability."
+
+# ============================================================
+# MOMENTUM BREAKOUT SIGNALS
+# ============================================================
+
+def generate_momentum_candidates(
+    symbol,
+    stock_rows,
+    spy_rows,
+    lookback,
+    volume_multiplier,
+    atr_multiplier,
+):
+    """
+    Long-only daily momentum breakout.
+
+    Signal is evaluated after a completed daily close.
+    Entry is at the next available session's open.
+
+    The breakout level excludes the signal day's high.
+    The volume average excludes the signal day's volume.
+    """
+
+    candidates = []
+
+    stock = prepare_daily_bars(stock_rows)
+    spy = prepare_daily_bars(spy_rows)
+
+    spy_by_date = {
+        bar["date"]: bar
+        for bar in spy
+    }
+
+    strategy_name = (
+        f"MOM_{lookback}D_VOL"
+        f"{int(volume_multiplier * 10)}_ATR"
+        f"{int(atr_multiplier)}"
     )
 
+    for index in range(1, len(stock) - 1):
+        signal = stock[index]
+        entry_bar = stock[index + 1]
 
-if __name__ == "__main__":
-    main()
+        if signal["date"] not in spy_by_date:
+            continue
+
+        market = spy_by_date[signal["date"]]
+
+        if (
+            signal["close"] < MIN_STOCK_PRICE
+            or signal["close"] <= 0
+        ):
+            continue
+
+        if "ma20" not in signal or "ma50" not in signal:
+            continue
+
+        if "atr14" not in signal:
+            continue
+
+        if "return20" not in signal:
+            continue
+
+        if signal["close"] <= signal["ma20"]:
+            continue
+
+        if signal["close"] <= signal["ma50"]:
+            continue
+
+        if market["close"] <= 0:
+            continue
+
+        if "ma50" not in market:
+            continue
+
+        if "return20" not in market:
+            continue
+
+        # Market regime filter.
+        if market["close"] <= market["ma50"]:
+            continue
+
+        # Stock must outperform SPY over 20 trading days.
+        if signal["return20"] <= market["return20"]:
+            continue
+
+        # Previous completed highs exclude the signal bar.
+        if lookback == 20:
+            breakout_level = signal.get("prior20_high")
+        else:
+            breakout_level = signal.get("prior55_high")
+
+        if breakout_level is None or breakout_level <= 0:
+            continue
+
+        # Close must break the previous high.
+        if signal["close"] <= breakout_level:
+            continue
+
+        volume_avg = signal.get("prior20_volume_avg", 0)
+
+        if volume_avg <= 0:
+            continue
+
+        if signal["volume"] < volume_multiplier * volume_avg:
+            continue
+
+        # Avoid chasing an excessive overnight gap.
+        entry_price = entry_bar["open"]
+
+        if entry_price <= 0:
+            continue
+
+        if (
+            entry_price
+            > breakout_level * (1 + MAX_ENTRY_GAP_PCT)
+        ):
+            continue
+
+        atr = signal["atr14"]
+
+        if atr <= 0:
+            continue
+
+        stop_price = (
+            entry_price - atr_multiplier * atr
+        )
+
+        if stop_price <= 0 or stop_price >= entry_price:
+            continue
+
+        risk_per_share = entry_price - stop_price
+
+        target_price = (
+            entry_price
+            + REWARD_RISK_RATIO * risk_per_share
+        )
+
+        exit_price = None
+        exit_timestamp = None
+        exit_reason = None
+
+        # Start examining prices on the entry session.
+        for future in stock[index + 1:]:
+            if future["timestamp"] < entry_bar["timestamp"]:
+                continue
+
+            # Gap-aware exits.
+            if future["open"] <= stop_price:
+                exit_price = future["open"]
+                exit_timestamp = future["timestamp"]
+                exit_reason = "STOP_GAP"
+                break
+
+            if future["open"] >= target_price:
+                exit_price = target_price
+                exit_timestamp = future["timestamp"]
+                exit_reason = "TARGET"
+                break
+
+            hit_stop = future["low"] <= stop_price
+            hit_target = future["high"] >= target_price
+
+            # Daily OHLC cannot reveal which was hit first.
+            # Assume the stop was hit first.
+            if hit_stop and hit_target:
+                exit_price = stop_price
+                exit_timestamp = future["timestamp"]
+                exit_reason = "STOP_AMBIGUOUS"
+                break
+
+            if hit_stop:
+                exit_price = stop_price
+                exit_timestamp = future["timestamp"]
+                exit_reason = "STOP"
+                break
+
+            if hit_target:
+                exit_price = target_price
+                exit_timestamp = future["timestamp"]
+                exit_reason = "TARGET"
+                break
+
+        if exit_price is None:
+            last_bar = stock[-1]
+            exit_price = last_bar["close"]
+            exit_timestamp = last_bar["timestamp"]
+            exit_reason = "END_OF_TEST"
+
+        candidates.append({
+            "symbol": symbol,
+            "trading_day": str(signal["date"]),
+            "entry_time": entry_bar["timestamp"],
+            "exit_time": exit_t
