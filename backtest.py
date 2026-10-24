@@ -1,33 +1,58 @@
 import os
+import sys
 import time
 import logging
-import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from itertools import islice
 
-import pandas as pd
 import requests
+import pandas as pd
 
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
 
-START_DATE = "2024-10-23T00:00:00Z"
-END_DATE = "2026-10-24T00:00:00Z"
+ALPACA_KEY = os.getenv("APCA_API_KEY_ID")
+ALPACA_SECRET = os.getenv("APCA_API_SECRET_KEY")
 
-# Initial test universe. Expand only after validating data access.
-SYMBOLS = [
-    "SPY",
-    "QQQ",
-    "IWM",
-    "AAPL",
-    "MSFT",
-    "NVDA",
-    "AMD",
-    "META",
-    "AMZN",
-    "TSLA",
-]
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
+
+DATA_URL = "https://data.alpaca.markets/v2"
+TRADING_URL = "https://paper-api.alpaca.markets/v2"
+
+# Historical testing period.
+# Longer periods require significantly more data and API time.
+BACKTEST_DAYS = int(os.getenv("BACKTEST_DAYS", "180"))
+
+# Dynamically discovered stocks are screened for liquidity.
+MIN_PRICE = 5.00
+MAX_PRICE = 500.00
+MIN_AVG_DOLLAR_VOLUME = 10_000_000
+
+# Maximum number of dynamically selected stocks tested intraday.
+# This is NOT a fixed ticker list.
+MAX_CANDIDATES = int(os.getenv("MAX_CANDIDATES", "100"))
+
+CAPITAL_BUCKETS = [500, 1000, 2500, 5000]
+
+MAX_OPEN_POSITIONS = 3
+RISK_PER_TRADE = 0.01
+
+REWARD_RISK_RATIO = 2.0
+VOLUME_MULTIPLIER = 1.5
+
+# Estimated total trading friction per side, in basis points.
+# 5 basis points = 0.05%.
+COST_BPS_PER_SIDE = 5
+
+# Additional assumed slippage per side.
+SLIPPAGE_BPS_PER_SIDE = 3
+
+# Minimum entry price above the opening range.
+# 0.0005 = 0.05%.
+BREAKOUT_BUFFER = 0.0005
 
 STRATEGIES = {
     "ORB_5M": 5,
@@ -35,303 +60,471 @@ STRATEGIES = {
     "ORB_30M": 30,
 }
 
-# Volume confirmation threshold.
-VOLUME_MULTIPLIER = 1.5
+# Conservative risk controls.
+MIN_STOP_PERCENT = 0.002
+MAX_STOP_PERCENT = 0.05
 
-# Target is two times the initial risk.
-REWARD_RISK_RATIO = 2.0
+# Fractional shares are simulated mathematically.
+# Actual brokerage support and order rules must be checked separately.
 
-# Estimated transaction cost per side, in basis points.
-# 5 basis points = 0.05% per side.
-COST_BPS_PER_SIDE = 5.0
-
-ALPACA_KEY = os.getenv("APCA_API_KEY_ID")
-ALPACA_SECRET = os.getenv("APCA_API_SECRET_KEY")
-
-SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
-SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-
-RUN_ID = str(uuid.uuid4())
-
-API_URL = "https://data.alpaca.markets/v2/stocks/bars"
+REQUEST_TIMEOUT = 60
+MAX_RETRIES = 5
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
+    format="%(asctime)s %(levelname)s: %(message)s",
 )
 
-session = requests.Session()
+log = logging.getLogger("breakout-backtest")
+
+
+# ============================================================
+# API HELPERS
+# ============================================================
 
 if not ALPACA_KEY or not ALPACA_SECRET:
-    raise RuntimeError(
-        "Missing APCA_API_KEY_ID or APCA_API_SECRET_KEY."
+    raise SystemExit(
+        "Missing GitHub secrets APCA_API_KEY_ID "
+        "or APCA_API_SECRET_KEY."
     )
 
-if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
-    raise RuntimeError(
-        "Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY. "
-        "Configure these in Render before running the backtest."
-    )
-
-session.headers.update({
+SESSION = requests.Session()
+SESSION.headers.update({
     "APCA-API-KEY-ID": ALPACA_KEY,
     "APCA-API-SECRET-KEY": ALPACA_SECRET,
+    "accept": "application/json",
 })
 
 
-# ============================================================
-# DOWNLOAD HISTORICAL MINUTE BARS
-# ============================================================
+def api_get(url, params=None):
+    """GET with retries for temporary errors and rate limiting."""
 
-def download_bars(symbol):
-    logging.info("Downloading historical minute bars for %s", symbol)
+    for attempt in range(MAX_RETRIES):
+        try:
+            response = SESSION.get(
+                url,
+                params=params,
+                timeout=REQUEST_TIMEOUT,
+            )
 
-    params = {
-        "symbols": symbol,
-        "timeframe": "1Min",
-        "start": START_DATE,
-        "end": END_DATE,
-        "limit": 10000,
-        "adjustment": "all",
-        "feed": "iex",
-        "sort": "asc",
-    }
+            if response.status_code == 429:
+                wait = min(60, 5 * (attempt + 1))
+                log.warning("Rate limited. Waiting %s seconds.", wait)
+                time.sleep(wait)
+                continue
 
-    all_rows = []
-    page_token = None
+            if response.status_code >= 500:
+                time.sleep(2 * (attempt + 1))
+                continue
+
+            response.raise_for_status()
+            return response.json()
+
+        except requests.RequestException as exc:
+            if attempt == MAX_RETRIES - 1:
+                raise RuntimeError(
+                    f"API request failed: {exc}"
+                ) from exc
+
+            time.sleep(2 * (attempt + 1))
+
+    raise RuntimeError("API request failed after retries.")
+
+
+def chunks(items, size):
+    iterator = iter(items)
 
     while True:
-        if page_token:
-            params["page_token"] = page_token
-        else:
-            params.pop("page_token", None)
+        batch = list(islice(iterator, size))
 
-        response = session.get(
-            API_URL,
-            params=params,
-            timeout=60,
-        )
-
-        if response.status_code == 429:
-            logging.warning(
-                "Rate limit reached for %s. Waiting 30 seconds.",
-                symbol,
-            )
-            time.sleep(30)
-            continue
-
-        if response.status_code != 200:
-            raise RuntimeError(
-                f"Alpaca request failed for {symbol}: "
-                f"HTTP {response.status_code}: {response.text[:500]}"
-            )
-
-        payload = response.json()
-        rows = payload.get("bars", {}).get(symbol, [])
-
-        all_rows.extend(rows)
-
-        page_token = payload.get("next_page_token")
-
-        logging.info(
-            "%s: downloaded %s bars so far",
-            symbol,
-            len(all_rows),
-        )
-
-        if not page_token:
+        if not batch:
             break
 
-        time.sleep(0.25)
+        yield batch
 
-    if not all_rows:
-        logging.warning(
-            "No historical bars returned for %s.", symbol
-        )
-        return pd.DataFrame()
 
-    df = pd.DataFrame(all_rows)
+# ============================================================
+# DISCOVER THE STOCK UNIVERSE
+# ============================================================
 
-    df["timestamp"] = pd.to_datetime(
-        df["t"],
-        utc=True,
-    ).dt.tz_convert("America/New_York")
+def discover_assets():
+    """
+    Discover active US equities from Alpaca.
+    No hardcoded ticker universe is used.
+    """
 
-    df = df.rename(columns={
-        "o": "open",
-        "h": "high",
-        "l": "low",
-        "c": "close",
-        "v": "volume",
+    url = f"{TRADING_URL}/assets"
+
+    payload = api_get(url, {
+        "status": "active",
+        "asset_class": "us_equity",
     })
 
-    df = df.sort_values("timestamp")
-    df = df.drop_duplicates("timestamp")
-    df = df.set_index("timestamp")
+    symbols = []
 
-    # Keep regular US stock-market hours only.
-    df = df.between_time(
-        "09:30",
-        "15:59",
-        inclusive="both",
+    for asset in payload:
+        symbol = asset.get("symbol", "")
+        exchange = asset.get("exchange", "")
+        tradable = asset.get("tradable", False)
+
+        if not symbol or not tradable:
+            continue
+
+        # Exclude symbols that are unlikely to be ordinary stocks.
+        if any(char in symbol for char in "^/$"):
+            continue
+
+        if len(symbol) > 5:
+            continue
+
+        if exchange not in {
+            "NYSE",
+            "NASDAQ",
+            "NYSEARCA",
+            "NYSEAMERICAN",
+            "ARCA",
+            "BATS",
+        }:
+            continue
+
+        symbols.append(symbol)
+
+    symbols = sorted(set(symbols))
+
+    log.info("Discovered %s active equity symbols.", len(symbols))
+
+    return symbols
+
+
+# ============================================================
+# HISTORICAL BAR RETRIEVAL
+# ============================================================
+
+def fetch_bars(symbols, timeframe, start, end, feed="iex"):
+    """
+    Fetch historical bars in batches and follow pagination tokens.
+    Returns a DataFrame indexed by symbol and timestamp.
+    """
+
+    collected = []
+
+    for batch in chunks(symbols, 100):
+        token = None
+
+        while True:
+            params = {
+                "symbols": ",".join(batch),
+                "timeframe": timeframe,
+                "start": start.isoformat().replace("+00:00", "Z"),
+                "end": end.isoformat().replace("+00:00", "Z"),
+                "limit": 10000,
+                "adjustment": "split",
+                "feed": feed,
+                "sort": "asc",
+            }
+
+            if token:
+                params["page_token"] = token
+
+            payload = api_get(
+                f"{DATA_URL}/stocks/bars",
+                params,
+            )
+
+            bars = payload.get("bars", {})
+
+            for symbol, rows in bars.items():
+                for row in rows:
+                    collected.append({
+                        "symbol": symbol,
+                        "timestamp": pd.to_datetime(
+                            row["t"], utc=True
+                        ),
+                        "open": float(row["o"]),
+                        "high": float(row["h"]),
+                        "low": float(row["l"]),
+                        "close": float(row["c"]),
+                        "volume": float(row["v"]),
+                    })
+
+            token = payload.get("next_page_token")
+
+            if not token:
+                break
+
+        log.info(
+            "Retrieved %s bars so far.",
+            len(collected),
+        )
+
+    if not collected:
+        return pd.DataFrame(
+            columns=[
+                "symbol", "timestamp", "open",
+                "high", "low", "close", "volume",
+            ]
+        )
+
+    df = pd.DataFrame(collected)
+
+    df = df.drop_duplicates(
+        subset=["symbol", "timestamp"]
     )
 
-    # Exclude weekends.
-    df = df[df.index.dayofweek < 5]
-
-    return df[["open", "high", "low", "close", "volume"]]
+    return df.sort_values(
+        ["symbol", "timestamp"]
+    ).reset_index(drop=True)
 
 
 # ============================================================
-# SIMULATE ONE OPENING-RANGE STRATEGY
+# LIQUIDITY SCREEN
 # ============================================================
 
-def simulate_strategy(symbol, df, strategy_name, opening_minutes):
+def screen_universe(all_symbols, end):
+    """
+    Screen all discoverable symbols using recent daily bars.
+    Eligible symbols are ranked by average dollar volume.
+    """
+
+    start = end - timedelta(days=45)
+
+    log.info("Screening discovered stocks using daily bars.")
+
+    daily = fetch_bars(
+        all_symbols,
+        "1Day",
+        start,
+        end,
+        feed="iex",
+    )
+
+    if daily.empty:
+        raise RuntimeError(
+            "No daily bars returned. Check Alpaca data access."
+        )
+
+    daily["dollar_volume"] = (
+        daily["close"] * daily["volume"]
+    )
+
+    candidates = []
+
+    for symbol, group in daily.groupby("symbol"):
+        group = group.sort_values("timestamp")
+
+        # Require sufficient observations to reduce thin-data cases.
+        if len(group) < 10:
+            continue
+
+        last_price = float(group.iloc[-1]["close"])
+
+        avg_dollar_volume = float(
+            group["dollar_volume"].tail(20).mean()
+        )
+
+        if not MIN_PRICE <= last_price <= MAX_PRICE:
+            continue
+
+        if avg_dollar_volume < MIN_AVG_DOLLAR_VOLUME:
+            continue
+
+        candidates.append({
+            "symbol": symbol,
+            "last_price": last_price,
+            "avg_dollar_volume": avg_dollar_volume,
+        })
+
+    candidates.sort(
+        key=lambda row: row["avg_dollar_volume"],
+        reverse=True,
+    )
+
+    if MAX_CANDIDATES > 0:
+        candidates = candidates[:MAX_CANDIDATES]
+
+    symbols = [row["symbol"] for row in candidates]
+
+    log.info(
+        "%s stocks passed the liquidity screen.",
+        len(symbols),
+    )
+
+    for row in candidates[:20]:
+        log.info(
+            "Candidate %-8s price=$%.2f avg dollar volume=$%.0f",
+            row["symbol"],
+            row["last_price"],
+            row["avg_dollar_volume"],
+        )
+
+    return symbols
+
+
+# ============================================================
+# BAR PREPARATION
+# ============================================================
+
+def prepare_intraday_data(df):
+    """
+    Convert UTC timestamps to New York time and retain
+    regular-session bars.
+    """
+
+    if df.empty:
+        return df
+
+    df = df.copy()
+
+    df["timestamp_ny"] = (
+        df["timestamp"].dt.tz_convert("America/New_York")
+    )
+
+    df["date"] = df["timestamp_ny"].dt.date
+
+    df["minute"] = (
+        df["timestamp_ny"].dt.hour * 60
+        + df["timestamp_ny"].dt.minute
+    )
+
+    # Regular US stock session: 9:30 AM to 4:00 PM ET.
+    df = df[
+        (df["minute"] >= 570)
+        & (df["minute"] < 960)
+    ].copy()
+
+    return df.sort_values(
+        ["date", "symbol", "timestamp"]
+    ).reset_index(drop=True)
+
+
+# ============================================================
+# CREATE BREAKOUT SIGNALS
+# ============================================================
+
+def generate_trades(df, strategy_name, opening_minutes):
+    """
+    One long trade opportunity per symbol per session.
+    Entry is modeled at the next available bar open after
+    a confirmed breakout.
+    """
+
     trades = []
 
     if df.empty:
         return trades
 
-    grouped = df.groupby(df.index.date)
+    for (symbol, session_date), day in df.groupby(
+        ["symbol", "date"]
+    ):
+        day = day.sort_values("timestamp").reset_index(drop=True)
 
-    for trading_date, day in grouped:
-        day = day.sort_index()
+        opening_end = 570 + opening_minutes
 
-        # Require enough data for the opening range and confirmation.
-        if len(day) < opening_minutes + 10:
+        opening = day[
+            (day["minute"] >= 570)
+            & (day["minute"] < opening_end)
+        ]
+
+        if len(opening) < opening_minutes:
             continue
 
-        # Minute timestamps identify the beginning of each bar.
-        opening_end_minute = 9 * 60 + 30 + opening_minutes
+        range_high = float(opening["high"].max())
+        range_low = float(opening["low"].min())
 
-        minute_of_day = day.index.hour * 60 + day.index.minute
-
-        opening_mask = minute_of_day < opening_end_minute
-        opening_bars = day[opening_mask]
-
-        if len(opening_bars) < opening_minutes:
+        if range_low <= 0 or range_high <= range_low:
             continue
 
-        range_high = float(opening_bars["high"].max())
-        range_low = float(opening_bars["low"].min())
+        risk_distance = range_high - range_low
 
-        if range_high <= range_low:
+        risk_percent = risk_distance / range_high
+
+        if not MIN_STOP_PERCENT <= risk_percent <= MAX_STOP_PERCENT:
             continue
 
-        after_opening = day[~opening_mask]
+        after_opening = day[
+            day["minute"] >= opening_end
+        ].reset_index(drop=True)
 
         if len(after_opening) < 2:
             continue
 
+        average_opening_volume = float(
+            opening["volume"].mean()
+        )
+
+        if average_opening_volume <= 0:
+            continue
+
         entered = False
 
-        for i in range(5, len(after_opening) - 1):
-            bar = after_opening.iloc[i]
+        for index in range(len(after_opening) - 1):
+            bar = after_opening.iloc[index]
+            next_bar = after_opening.iloc[index + 1]
 
-            # Volume must exceed the average of the previous
-            # five available one-minute bars.
-            previous_volumes = after_opening["volume"].iloc[i - 5:i]
-            average_volume = float(previous_volumes.mean())
-
-            if average_volume <= 0:
-                continue
-
-            volume_confirmed = (
-                float(bar["volume"])
-                >= VOLUME_MULTIPLIER * average_volume
+            breakout_level = (
+                range_high * (1 + BREAKOUT_BUFFER)
             )
 
-            breakout_confirmed = (
-                float(bar["close"]) > range_high
-            )
+            if (
+                float(bar["close"]) > breakout_level
+                and float(bar["volume"])
+                >= average_opening_volume * VOLUME_MULTIPLIER
+            ):
+                entry = float(next_bar["open"])
 
-            if not (volume_confirmed and breakout_confirmed):
-                continue
+                # Do not enter if the next bar opens beyond
+                # the intended target or stop geometry.
+                stop = range_low
 
-            # Enter at the next bar's open to avoid assuming
-            # execution at the same close that created the signal.
-            entry_bar = after_opening.iloc[i + 1]
-            entry_price = float(entry_bar["open"])
+                if entry <= stop:
+                    continue
 
-            if entry_price <= range_low:
-                continue
+                risk = entry - stop
+                target = entry + risk * REWARD_RISK_RATIO
 
-            risk = entry_price - range_low
+                # Walk forward through subsequent bars.
+                exit_price = float(
+                    after_opening.iloc[-1]["close"]
+                )
 
-            if risk <= 0:
-                continue
+                exit_reason = "EOD"
 
-            stop_price = range_low
-            target_price = (
-                entry_price
-                + REWARD_RISK_RATIO * risk
-            )
+                for future_index in range(index + 1, len(after_opening)):
+                    future = after_opening.iloc[future_index]
 
-            entry_time = after_opening.index[i + 1]
+                    future_low = float(future["low"])
+                    future_high = float(future["high"])
 
-            exit_price = float(day.iloc[-1]["close"])
-            exit_time = day.index[-1]
-            exit_reason = "END_OF_DAY"
+                    # Conservative assumption: if stop and target
+                    # both occur within the same bar, assume stop first.
+                    if future_low <= stop:
+                        exit_price = min(
+                            stop,
+                            float(future["open"])
+                        )
+                        exit_reason = "STOP"
+                        break
 
-            # Check the bars after entry. If stop and target
-            # are both touched in one bar, assume stop first.
-            for j in range(i + 1, len(after_opening)):
-                future_bar = after_opening.iloc[j]
-                future_time = after_opening.index[j]
+                    if future_high >= target:
+                        exit_price = target
+                        exit_reason = "TARGET"
+                        break
 
-                low_price = float(future_bar["low"])
-                high_price = float(future_bar["high"])
+                trades.append({
+                    "symbol": symbol,
+                    "date": str(session_date),
+                    "strategy": strategy_name,
+                    "entry": entry,
+                    "stop": stop,
+                    "target": target,
+                    "exit": exit_price,
+                    "exit_reason": exit_reason,
+                    "entry_time": str(next_bar["timestamp"]),
+                })
 
-                if low_price <= stop_price:
-                    exit_price = stop_price
-                    exit_time = future_time
-                    exit_reason = "STOP_LOSS"
-                    break
+                entered = True
+                break
 
-                if high_price >= target_price:
-                    exit_price = target_price
-                    exit_time = future_time
-                    exit_reason = "TAKE_PROFIT"
-                    break
-
-            gross_return_pct = (
-                (exit_price - entry_price)
-                / entry_price
-            ) * 100.0
-
-            total_cost_pct = (
-                2 * COST_BPS_PER_SIDE / 100.0
-            )
-
-            net_return_pct = (
-                gross_return_pct - total_cost_pct
-            )
-
-            # One-share equivalent. This is not a recommended
-            # position size or a portfolio-level dollar forecast.
-            net_pnl = (
-                exit_price - entry_price
-                - entry_price * total_cost_pct / 100.0
-            )
-
-            trades.append({
-                "run_id": RUN_ID,
-                "strategy": strategy_name,
-                "symbol": symbol,
-                "entry_time": entry_time.isoformat(),
-                "exit_time": exit_time.isoformat(),
-                "entry_price": round(entry_price, 4),
-                "exit_price": round(exit_price, 4),
-                "shares": 1,
-                "pnl": round(net_pnl, 4),
-                "pnl_percent": round(net_return_pct, 4),
-                "exit_reason": exit_reason,
-            })
-
-            entered = True
-            break
-
-        # At most one long trade per symbol per day per strategy.
         if entered:
             continue
 
@@ -339,115 +532,285 @@ def simulate_strategy(symbol, df, strategy_name, opening_minutes):
 
 
 # ============================================================
-# PERFORMANCE METRICS
+# PORTFOLIO SIMULATION
 # ============================================================
 
-def calculate_metrics(trades):
-    if not trades:
-        return {
-            "trades": 0,
-            "win_rate_pct": 0.0,
-            "average_return_pct": 0.0,
-            "average_win_pct": 0.0,
-            "average_loss_pct": 0.0,
-            "profit_factor": 0.0,
-            "max_drawdown_pct": 0.0,
+def simulate_portfolio(trades, starting_capital):
+    """
+    Simulates one portfolio with:
+      - Maximum three simultaneous positions.
+      - Risk-based position sizing.
+      - Cash constraints.
+      - Fractional shares.
+      - Estimated costs and slippage.
+    """
+
+    ordered = sorted(
+        trades,
+        key=lambda trade: trade["entry_time"],
+    )
+
+    cash = float(starting_capital)
+    equity = float(starting_capital)
+
+    open_positions = []
+    completed = []
+
+    equity_curve = [starting_capital]
+    skipped = 0
+
+    for trade in ordered:
+        entry_time = pd.to_datetime(
+            trade["entry_time"], utc=True
+        )
+
+        # Close positions before the next trade timestamp.
+        remaining = []
+
+        for position in open_positions:
+            if position["exit_time"] <= entry_time:
+                cash += position["proceeds"]
+                completed.append(position["result"])
+            else:
+                remaining.append(position)
+
+        open_positions = remaining
+
+        equity = cash + sum(
+            position["market_value"]
+            for position in open_positions
+        )
+
+        equity_curve.append(equity)
+
+        if len(open_positions) >= MAX_OPEN_POSITIONS:
+            skipped += 1
+            continue
+
+        entry = float(trade["entry"])
+        stop = float(trade["stop"])
+        exit_price = float(trade["exit"])
+
+        risk_per_share = entry - stop
+
+        if entry <= 0 or risk_per_share <= 0:
+            skipped += 1
+            continue
+
+        risk_budget = equity * RISK_PER_TRADE
+
+        shares_by_risk = risk_budget / risk_per_share
+        shares_by_cash = cash / entry
+
+        shares = min(
+            shares_by_risk,
+            shares_by_cash,
+        )
+
+        if shares <= 0:
+            skipped += 1
+            continue
+
+        entry_cost_rate = (
+            COST_BPS_PER_SIDE + SLIPPAGE_BPS_PER_SIDE
+        ) / 10000
+
+        exit_cost_rate = entry_cost_rate
+
+        entry_cost = entry * shares * entry_cost_rate
+        exit_cost = exit_price * shares * exit_cost_rate
+
+        entry_cash = entry * shares + entry_cost
+
+        if entry_cash > cash:
+            shares = cash / (
+                entry * (1 + entry_cost_rate)
+            )
+
+            if shares <= 0:
+                skipped += 1
+                continue
+
+            entry_cost = entry * shares * entry_cost_rate
+            exit_cost = exit_price * shares * exit_cost_rate
+            entry_cash = entry * shares + entry_cost
+
+        cash -= entry_cash
+
+        exit_proceeds = (
+            exit_price * shares - exit_cost
+        )
+
+        pnl = (
+            (exit_price - entry) * shares
+            - entry_cost
+            - exit_cost
+        )
+
+        result = {
+            **trade,
+            "shares": shares,
+            "pnl": pnl,
+            "return_pct": (
+                pnl / entry_cash * 100
+                if entry_cash > 0 else 0
+            ),
         }
 
-    results = pd.DataFrame(trades)
-    returns = results["pnl_percent"].astype(float)
+        # Position's historical exit is used to enforce
+        # the maximum concurrent-position rule.
+        exit_time = pd.to_datetime(
+            trade["entry_time"], utc=True
+        ) + pd.Timedelta(days=1)
 
-    wins = returns[returns > 0]
-    losses = returns[returns < 0]
+        open_positions.append({
+            "exit_time": exit_time,
+            "proceeds": exit_proceeds,
+            "market_value": exit_proceeds,
+            "result": result,
+        })
 
-    if len(losses):
-        profit_factor = (
-            float(wins.sum()) / abs(float(losses.sum()))
-            if float(losses.sum()) != 0
-            else float("inf")
-        )
-    else:
-        profit_factor = (
-            float("inf") if len(wins) else 0.0
-        )
+    # Close remaining positions at the end of the simulation.
+    for position in open_positions:
+        cash += position["proceeds"]
+        completed.append(position["result"])
 
-    # Approximate equal-sized sequential trade portfolio.
-    # Trades are sorted by exit time.
-    ordered = results.sort_values("exit_time")
-    equity = 1.0
-    peak = 1.0
-    max_drawdown = 0.0
+    final_equity = cash
 
-    for ret in ordered["pnl_percent"].astype(float):
-        equity *= 1.0 + ret / 100.0
-        peak = max(peak, equity)
+    pnls = [float(row["pnl"]) for row in completed]
+    wins = [pnl for pnl in pnls if pnl > 0]
+    losses = [pnl for pnl in pnls if pnl < 0]
 
-        if peak > 0:
-            drawdown = (peak - equity) / peak * 100.0
-            max_drawdown = max(max_drawdown, drawdown)
+    total_return_pct = (
+        (final_equity / starting_capital) - 1
+    ) * 100
+
+    gross_profit = sum(wins)
+    gross_loss = abs(sum(losses))
+
+    profit_factor = (
+        gross_profit / gross_loss
+        if gross_loss > 0
+        else float("inf") if gross_profit > 0 else 0
+    )
+
+    max_drawdown_pct = calculate_drawdown(
+        starting_capital,
+        pnls,
+    )
 
     return {
-        "trades": int(len(results)),
-        "win_rate_pct": round(
-            float((returns > 0).mean() * 100.0), 2
+        "starting_capital": starting_capital,
+        "ending_equity": final_equity,
+        "net_profit": final_equity - starting_capital,
+        "return_pct": total_return_pct,
+        "trades": len(completed),
+        "wins": len(wins),
+        "losses": len(losses),
+        "win_rate_pct": (
+            len(wins) / len(completed) * 100
+            if completed else 0
         ),
-        "average_return_pct": round(
-            float(returns.mean()), 4
-        ),
-        "average_win_pct": round(
-            float(wins.mean()), 4
-        ) if len(wins) else 0.0,
-        "average_loss_pct": round(
-            float(losses.mean()), 4
-        ) if len(losses) else 0.0,
-        "profit_factor": round(
-            profit_factor, 4
-        ) if profit_factor != float("inf") else "Infinity",
-        "max_drawdown_pct": round(max_drawdown, 2),
+        "profit_factor": profit_factor,
+        "max_drawdown_pct": max_drawdown_pct,
+        "skipped_trades": skipped,
+        "completed_trades": completed,
     }
 
 
+def calculate_drawdown(starting_capital, pnls):
+    equity = float(starting_capital)
+    peak = equity
+    max_drawdown = 0.0
+
+    for pnl in pnls:
+        equity += pnl
+        peak = max(peak, equity)
+
+        if peak > 0:
+            drawdown = (peak - equity) / peak * 100
+            max_drawdown = max(max_drawdown, drawdown)
+
+    return max_drawdown
+
+
 # ============================================================
-# SAVE RESULTS TO SUPABASE
+# RESULTS
 # ============================================================
 
-def save_trades(trades):
-    if not trades:
-        logging.warning("No trades to save.")
+def print_results(strategy_name, capital, result):
+    log.info("")
+    log.info("=" * 65)
+    log.info("STRATEGY: %s", strategy_name)
+    log.info("STARTING CAPITAL: $%.2f", capital)
+    log.info("ENDING EQUITY: $%.2f", result["ending_equity"])
+    log.info("NET PROFIT: $%.2f", result["net_profit"])
+    log.info("RETURN: %.2f%%", result["return_pct"])
+    log.info("TRADES: %s", result["trades"])
+    log.info("WINS: %s", result["wins"])
+    log.info("LOSSES: %s", result["losses"])
+    log.info("WIN RATE: %.2f%%", result["win_rate_pct"])
+    log.info("PROFIT FACTOR: %.3f", result["profit_factor"])
+    log.info("MAX DRAWDOWN: %.2f%%", result["max_drawdown_pct"])
+    log.info("SKIPPED TRADES: %s", result["skipped_trades"])
+    log.info("=" * 65)
+
+
+def save_to_supabase(rows):
+    """
+    Optional results storage.
+    Backtesting still runs when Supabase is not configured.
+    """
+
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        log.info("Supabase not configured; skipping database save.")
         return
 
-    url = f"{SUPABASE_URL}/rest/v1/backtest_results"
+    url = (
+        f"{SUPABASE_URL}/rest/v1/backtest_results"
+    )
 
     headers = {
-        "apikey": SUPABASE_SERVICE_KEY,
-        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
         "Content-Type": "application/json",
         "Prefer": "return=minimal",
     }
 
-    # Insert in small batches to avoid oversized requests.
-    for start in range(0, len(trades), 100):
-        batch = trades[start:start + 100]
+    for row in rows:
+        payload = {
+            "strategy": row["strategy"],
+            "starting_capital": row["starting_capital"],
+            "ending_equity": row["ending_equity"],
+            "net_profit": row["net_profit"],
+            "return_pct": row["return_pct"],
+            "trades": row["trades"],
+            "wins": row["wins"],
+            "losses": row["losses"],
+            "win_rate_pct": row["win_rate_pct"],
+            "profit_factor": (
+                row["profit_factor"]
+                if row["profit_factor"] != float("inf")
+                else None
+            ),
+            "max_drawdown_pct": row["max_drawdown_pct"],
+        }
 
         response = requests.post(
             url,
             headers=headers,
-            json=batch,
-            timeout=60,
+            json=payload,
+            timeout=REQUEST_TIMEOUT,
         )
 
         if response.status_code not in (200, 201, 204):
-            raise RuntimeError(
-                "Supabase insert failed: "
-                f"HTTP {response.status_code}: "
-                f"{response.text[:500]}"
+            log.error(
+                "Supabase save failed: %s %s",
+                response.status_code,
+                response.text[:500],
             )
-
-        logging.info(
-            "Saved %s of %s trades",
-            min(start + 100, len(trades)),
-            len(trades),
-        )
+        else:
+            log.info("Saved %s result to Supabase.", row["strategy"])
 
 
 # ============================================================
@@ -455,94 +818,99 @@ def save_trades(trades):
 # ============================================================
 
 def main():
-    logging.info("Starting historical backtest.")
-    logging.info("Run ID: %s", RUN_ID)
-    logging.info("Period: %s through %s", START_DATE, END_DATE)
-    logging.info("Symbols: %s", ", ".join(SYMBOLS))
-    logging.info("Strategies: %s", ", ".join(STRATEGIES))
+    end = datetime.now(timezone.utc)
 
-    all_trades = []
-    symbols_with_data = 0
+    # Request extra calendar days to cover weekends and holidays.
+    start = end - timedelta(days=BACKTEST_DAYS)
 
-    for symbol in SYMBOLS:
-        try:
-            df = download_bars(symbol)
+    log.info("Starting historical breakout backtest.")
+    log.info("Date range: %s to %s", start.date(), end.date())
+    log.info("Maximum simultaneous positions: %s", MAX_OPEN_POSITIONS)
+    log.info("Capital buckets: %s", CAPITAL_BUCKETS)
 
-            if df.empty:
-                logging.warning(
-                    "Skipping %s because no data was returned.",
-                    symbol,
-                )
-                continue
+    all_symbols = discover_assets()
 
-            symbols_with_data += 1
+    if not all_symbols:
+        raise RuntimeError("No eligible assets were discovered.")
 
-            logging.info(
-                "%s: received %s regular-session bars.",
-                symbol,
-                len(df),
-            )
+    candidates = screen_universe(all_symbols, end)
 
-            for strategy_name, minutes in STRATEGIES.items():
-                trades = simulate_strategy(
-                    symbol,
-                    df,
-                    strategy_name,
-                    minutes,
-                )
-
-                logging.info(
-                    "%s / %s: %s simulated trades",
-                    symbol,
-                    strategy_name,
-                    len(trades),
-                )
-
-                all_trades.extend(trades)
-
-        except Exception:
-            logging.exception(
-                "Failed while processing %s.", symbol
-            )
-            raise
-
-    logging.info(
-        "Historical data received for %s of %s symbols.",
-        symbols_with_data,
-        len(SYMBOLS),
-    )
-
-    logging.info(
-        "Total simulated trades: %s",
-        len(all_trades),
-    )
-
-    if all_trades:
-        trade_frame = pd.DataFrame(all_trades)
-
-        for strategy_name in STRATEGIES:
-            strategy_trades = trade_frame[
-                trade_frame["strategy"] == strategy_name
-            ].to_dict("records")
-
-            metrics = calculate_metrics(strategy_trades)
-
-            logging.info(
-                "RESULT %s: %s",
-                strategy_name,
-                metrics,
-            )
-
-        save_trades(all_trades)
-
-    else:
-        logging.warning(
-            "No trades were generated. Check historical data access "
-            "and strategy conditions before drawing conclusions."
+    if not candidates:
+        raise RuntimeError(
+            "No symbols passed the liquidity screen. "
+            "Check Alpaca data access or relax the screening thresholds."
         )
 
-    logging.info("Backtest finished. Run ID: %s", RUN_ID)
+    log.info(
+        "Downloading minute bars for %s selected stocks.",
+        len(candidates),
+    )
+
+    minute_bars = fetch_bars(
+        candidates,
+        "1Min",
+        start,
+        end,
+        feed="iex",
+    )
+
+    if minute_bars.empty:
+        raise RuntimeError(
+            "No minute bars returned. Check Alpaca subscription "
+            "and historical-data permissions."
+        )
+
+    minute_bars = prepare_intraday_data(minute_bars)
+
+    all_results = []
+
+    for strategy_name, opening_minutes in STRATEGIES.items():
+        log.info(
+            "Evaluating %s opening-range breakout.",
+            strategy_name,
+        )
+
+        trades = generate_trades(
+            minute_bars,
+            strategy_name,
+            opening_minutes,
+        )
+
+        log.info(
+            "%s generated %s trade candidates.",
+            strategy_name,
+            len(trades),
+        )
+
+        for capital in CAPITAL_BUCKETS:
+            result = simulate_portfolio(
+                trades,
+                capital,
+            )
+
+            result["strategy"] = strategy_name
+
+            print_results(
+                strategy_name,
+                capital,
+                result,
+            )
+
+            all_results.append(result)
+
+    save_to_supabase(all_results)
+
+    log.info("")
+    log.info("BACKTEST FINISHED.")
+    log.info(
+        "Results evaluated: %s strategy/capital combinations.",
+        len(all_results),
+    )
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as exc:
+        log.exception("BACKTEST FAILED: %s", exc)
+        sys.exit(1)
