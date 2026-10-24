@@ -1,15 +1,15 @@
 import os
 import time
 import logging
+import math
 from datetime import datetime, timezone
 
 import pandas as pd
 import yfinance as yf
+import requests
 
 from supabase import create_client
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import GetAssetsRequest
-from alpaca.trading.enums import AssetClass, AssetStatus
 
 
 # ============================================================
@@ -19,15 +19,19 @@ from alpaca.trading.enums import AssetClass, AssetStatus
 SCAN_INTERVAL_SECONDS = 300
 ASSET_REFRESH_SECONDS = 86400
 BATCH_SIZE = 50
+REQUEST_DELAY_SECONDS = 0.25
 
-# Safety: this worker NEVER submits orders.
+# Safety: this version NEVER submits orders.
 AUTOMATIC_ORDER_EXECUTION = False
 
-# Alpaca paper trading is required.
+# Alpaca paper trading only.
 PAPER_TRADING = True
 
 MIN_PRICE = 2.00
 MIN_AVERAGE_VOLUME = 100000
+
+ALPACA_ASSETS_URL = "https://paper-api.alpaca.markets/v2/assets"
+
 
 # ============================================================
 # LOGGING
@@ -93,21 +97,22 @@ alpaca = TradingClient(
 # ============================================================
 
 def log_event(message, level="INFO"):
-    """Write messages to Render logs and Supabase."""
+    """Write messages to application logs and Supabase."""
 
-    log_level = level.upper()
+    level = str(level).upper()
+    message = str(message)
 
-    if log_level == "ERROR":
+    if level == "ERROR":
         logger.error(message)
-    elif log_level == "WARNING":
+    elif level == "WARNING":
         logger.warning(message)
     else:
         logger.info(message)
 
     try:
         supabase.table("bot_logs").insert({
-            "level": log_level,
-            "message": str(message)[:1000],
+            "level": level,
+            "message": message[:1000],
         }).execute()
 
     except Exception as exc:
@@ -151,7 +156,7 @@ def get_bot_config():
 
 
 def update_bot_status(message, error=None):
-    """Update supported status columns without assuming the schema."""
+    """Update status columns that exist in the database."""
 
     try:
         response = (
@@ -179,11 +184,10 @@ def update_bot_status(message, error=None):
             "last_scan": now,
         }
 
-        if error:
-            possible_values["last_error"] = str(error)[:1000]
-
-        else:
-            possible_values["last_error"] = None
+        if "last_error" in existing_row:
+            possible_values["last_error"] = (
+                str(error)[:1000] if error else None
+            )
 
         updates = {
             key: value
@@ -207,55 +211,119 @@ def update_bot_status(message, error=None):
 
 
 # ============================================================
-# DISCOVER ALL ELIGIBLE STOCKS
+# ALPACA ASSET DISCOVERY
 # ============================================================
 
 def get_all_eligible_stocks():
     """
-    Retrieve active, tradable U.S. equity assets from Alpaca.
+    Retrieve eligible U.S. equity assets using Alpaca's raw
+    HTTP response instead of SDK Asset model validation.
 
-    This removes the old fixed 21-symbol watchlist.
-    Actual coverage depends on Alpaca's available assets
-    and the market-data subscription.
+    This avoids a whole-list validation failure when Alpaca
+    returns an exchange value unknown to the installed SDK.
     """
 
     log_event("Refreshing eligible stock universe.")
 
-    request = GetAssetsRequest(
-        status=AssetStatus.ACTIVE,
-        asset_class=AssetClass.US_EQUITY,
-    )
+    headers = {
+        "APCA-API-KEY-ID": ALPACA_API_KEY,
+        "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
+    }
 
-    assets = alpaca.get_all_assets(request)
+    params = {
+        "status": "active",
+        "asset_class": "us_equity",
+    }
+
+    try:
+        response = requests.get(
+            ALPACA_ASSETS_URL,
+            headers=headers,
+            params=params,
+            timeout=60,
+        )
+
+        response.raise_for_status()
+        assets = response.json()
+
+    except requests.RequestException as exc:
+        log_event(
+            f"Alpaca asset request failed: {exc}",
+            "ERROR",
+        )
+        raise
+
+    if not isinstance(assets, list):
+        raise RuntimeError(
+            "Unexpected response from Alpaca assets endpoint."
+        )
 
     symbols = []
+    skipped = 0
+
+    # Use only exchanges recognized by the installed SDK.
+    # Unknown exchange names are skipped, never relabeled.
+    supported_exchanges = {
+        "AMEX",
+        "ARCA",
+        "ASCX",
+        "BATS",
+        "NYSE",
+        "NASDAQ",
+        "NYSEARCA",
+        "FTXU",
+        "CBSE",
+        "GNSS",
+        "ERSX",
+        "OTC",
+        "CRYPTO",
+        "",
+    }
 
     for asset in assets:
         try:
-            if not asset.tradable:
+            if asset.get("class") != "us_equity":
                 continue
 
-            symbol = asset.symbol
-
-            if not symbol:
+            if asset.get("status") != "active":
                 continue
 
-            # Skip symbols that are unsuitable for ordinary
-            # ticker-based scanning, such as dotted share classes.
+            if asset.get("tradable") is not True:
+                continue
+
+            symbol = asset.get("symbol", "")
+            exchange = asset.get("exchange", "")
+
+            if not isinstance(symbol, str) or not symbol:
+                skipped += 1
+                continue
+
+            # Skip symbols containing punctuation, such as
+            # some preferred-stock and share-class tickers.
             if not symbol.isalnum():
+                continue
+
+            if exchange not in supported_exchanges:
+                skipped += 1
                 continue
 
             symbols.append(symbol)
 
-        except Exception:
+        except (AttributeError, TypeError):
+            skipped += 1
             continue
 
     symbols = sorted(set(symbols))
 
     log_event(
-        f"Eligible stock universe refreshed: "
-        f"{len(symbols)} symbols."
+        f"Stock universe refreshed: {len(symbols)} eligible "
+        f"symbols; {skipped} assets skipped."
     )
+
+    if not symbols:
+        raise RuntimeError(
+            "No eligible stocks found in Alpaca asset response."
+        )
 
     return symbols
 
@@ -285,10 +353,24 @@ def calculate_rsi(series, period=14):
     ).mean()
 
     relative_strength = (
-        average_gain / average_loss.replace(0, float("nan"))
+        average_gain
+        / average_loss.replace(0, float("nan"))
     )
 
     rsi = 100 - (100 / (1 + relative_strength))
+
+    # A continuously rising series can have zero average losses.
+    # Its RSI should be 100 rather than missing.
+    rsi = rsi.mask(
+        (average_loss == 0) & (average_gain > 0),
+        100.0,
+    )
+
+    # A flat series with no gains or losses receives neutral RSI.
+    rsi = rsi.mask(
+        (average_loss == 0) & (average_gain == 0),
+        50.0,
+    )
 
     return rsi
 
@@ -299,9 +381,9 @@ def calculate_rsi(series, period=14):
 
 def analyze_stock(symbol):
     """
-    Analyze a single symbol using recent daily price history.
+    Analyze recent daily price history.
 
-    Produces signals only. Does not place orders.
+    Generates signals only. Never submits orders.
     """
 
     try:
@@ -321,20 +403,25 @@ def analyze_stock(symbol):
                 "signal": "NO_DATA",
             }
 
-        # yfinance can return MultiIndex columns.
+        # Normalize yfinance's possible MultiIndex columns.
         if isinstance(data.columns, pd.MultiIndex):
             data.columns = data.columns.get_level_values(0)
 
-        required_columns = {"Close", "Volume"}
-
-        if not required_columns.issubset(set(data.columns)):
+        if not {"Close", "Volume"}.issubset(data.columns):
             return {
                 "symbol": symbol,
                 "signal": "INVALID_DATA",
             }
 
-        close = data["Close"].dropna()
-        volume = data["Volume"].dropna()
+        close = pd.to_numeric(
+            data["Close"],
+            errors="coerce",
+        ).dropna()
+
+        volume = pd.to_numeric(
+            data["Volume"],
+            errors="coerce",
+        ).dropna()
 
         if len(close) < 50 or len(volume) < 20:
             return {
@@ -349,17 +436,26 @@ def analyze_stock(symbol):
         sma50 = float(close.tail(50).mean())
 
         rsi_series = calculate_rsi(close)
+
+        if rsi_series.empty or pd.isna(rsi_series.iloc[-1]):
+            return {
+                "symbol": symbol,
+                "signal": "INVALID_INDICATORS",
+            }
+
         rsi_value = float(rsi_series.iloc[-1])
 
+        indicator_values = [
+            last_price,
+            average_volume,
+            sma20,
+            sma50,
+            rsi_value,
+        ]
+
         if not all(
-            pd.notna(value)
-            for value in [
-                last_price,
-                average_volume,
-                sma20,
-                sma50,
-                rsi_value,
-            ]
+            math.isfinite(value)
+            for value in indicator_values
         ):
             return {
                 "symbol": symbol,
@@ -372,10 +468,13 @@ def analyze_stock(symbol):
         elif average_volume < MIN_AVERAGE_VOLUME:
             signal = "FILTERED_LOW_VOLUME"
 
-        elif last_price > sma20 > sma50 and 40 <= rsi_value <= 65:
+        elif (
+            last_price > sma20 > sma50
+            and 40 <= rsi_value <= 65
+        ):
             signal = "BUY_SIGNAL"
 
-        elif last_price < sma20 and sma20 < sma50:
+        elif last_price < sma20 < sma50:
             signal = "SELL_SIGNAL"
 
         else:
@@ -404,7 +503,7 @@ def analyze_stock(symbol):
 # ============================================================
 
 def record_result(result):
-    """Record scan outcomes in the bot logs."""
+    """Record important scanner outcomes."""
 
     symbol = result.get("symbol", "UNKNOWN")
     signal = result.get("signal", "UNKNOWN")
@@ -433,11 +532,10 @@ def record_result(result):
 
 def run_market_scan(symbols):
     """
-    Scan the discovered universe in batches.
+    Scan eligible symbols sequentially in batches.
 
-    This is a broad-market scanner, not a guarantee that every
-    symbol can be analyzed on every cycle. Data providers can
-    throttle requests or fail to return some symbols.
+    Yahoo Finance may throttle or fail some requests.
+    Individual symbol errors do not stop the full scan.
     """
 
     total = len(symbols)
@@ -475,8 +573,7 @@ def run_market_scan(symbols):
 
             record_result(result)
 
-            # Pace requests to reduce the risk of throttling.
-            time.sleep(0.25)
+            time.sleep(REQUEST_DELAY_SECONDS)
 
         log_event(
             f"Scan progress: {scanned}/{total} symbols; "
@@ -520,7 +617,6 @@ def main():
                 update_bot_status(
                     "Paused: bot_status.enabled is not true."
                 )
-
                 time.sleep(30)
                 continue
 
@@ -541,16 +637,19 @@ def main():
 
             if (
                 not symbols
-                or now - last_asset_refresh >= ASSET_REFRESH_SECONDS
+                or now - last_asset_refresh
+                >= ASSET_REFRESH_SECONDS
             ):
-                symbols = get_all_eligible_stocks()
+                refreshed_symbols = get_all_eligible_stocks()
+
+                # Update the cache only after a successful refresh.
+                symbols = refreshed_symbols
                 last_asset_refresh = time.time()
 
             if not symbols:
                 update_bot_status(
                     "No eligible stocks found."
                 )
-
                 time.sleep(60)
                 continue
 
