@@ -1,15 +1,10 @@
 import os
 import time
 import logging
-import math
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
-import pandas as pd
-import yfinance as yf
 import requests
-
 from supabase import create_client
-from alpaca.trading.client import TradingClient
 
 
 # ============================================================
@@ -18,19 +13,26 @@ from alpaca.trading.client import TradingClient
 
 SCAN_INTERVAL_SECONDS = 300
 ASSET_REFRESH_SECONDS = 86400
-BATCH_SIZE = 50
+
+MIN_PRICE = 1.00
+MAX_PRICE = 10.00
+
+MIN_AVERAGE_DOLLAR_VOLUME = 5_000_000
+MIN_DAILY_MOVE_PERCENT = 3.0
+MIN_RELATIVE_VOLUME = 1.5
+
+BREAKOUT_LOOKBACK_BARS = 20
+MAX_CANDIDATES = 50
+
+DATA_FEED = "iex"
+PAPER_MODE_ONLY = True
+
+ALPACA_BASE_URL = "https://paper-api.alpaca.markets"
+ALPACA_DATA_URL = "https://data.alpaca.markets"
+
+REQUEST_TIMEOUT = 30
 REQUEST_DELAY_SECONDS = 0.25
-
-# Safety: this version NEVER submits orders.
-AUTOMATIC_ORDER_EXECUTION = False
-
-# Alpaca paper trading only.
-PAPER_TRADING = True
-
-MIN_PRICE = 2.00
-MIN_AVERAGE_VOLUME = 100000
-
-ALPACA_ASSETS_URL = "https://paper-api.alpaca.markets/v2/assets"
+BATCH_SIZE = 100
 
 
 # ============================================================
@@ -42,19 +44,17 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
 )
 
-logger = logging.getLogger("stock_bot")
+logger = logging.getLogger("momentum_scanner")
 
 
 # ============================================================
 # ENVIRONMENT VARIABLES
 # ============================================================
 
-ALPACA_API_KEY = os.environ.get("ALPACA_API_KEY")
-ALPACA_SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY")
-SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_SERVICE_ROLE_KEY = os.environ.get(
-    "SUPABASE_SERVICE_ROLE_KEY"
-)
+ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
+ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 
 required_variables = {
     "ALPACA_API_KEY": ALPACA_API_KEY,
@@ -64,8 +64,7 @@ required_variables = {
 }
 
 missing_variables = [
-    name
-    for name, value in required_variables.items()
+    name for name, value in required_variables.items()
     if not value
 ]
 
@@ -85,81 +84,43 @@ supabase = create_client(
     SUPABASE_SERVICE_ROLE_KEY,
 )
 
-alpaca = TradingClient(
-    ALPACA_API_KEY,
-    ALPACA_SECRET_KEY,
-    paper=True,
-)
+session = requests.Session()
+
+session.headers.update({
+    "APCA-API-KEY-ID": ALPACA_API_KEY,
+    "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
+})
 
 
 # ============================================================
-# DATABASE LOGGING
+# STATE
 # ============================================================
 
-def log_event(message, level="INFO"):
-    """Write messages to application logs and Supabase."""
+stock_symbols = []
+last_asset_refresh = 0
 
-    level = str(level).upper()
-    message = str(message)
 
-    if level == "ERROR":
-        logger.error(message)
-    elif level == "WARNING":
-        logger.warning(message)
-    else:
-        logger.info(message)
+# ============================================================
+# LOGGING TO SUPABASE
+# ============================================================
+
+def log_event(level, message):
+    message = str(message)[:4000]
+
+    getattr(logger, level.lower(), logger.info)(message)
 
     try:
         supabase.table("bot_logs").insert({
-            "level": level,
-            "message": message[:1000],
+            "level": level.upper(),
+            "message": message,
         }).execute()
-
     except Exception as exc:
-        logger.error(
-            "Could not write to Supabase bot_logs: %s",
-            exc,
-        )
-
-
-# ============================================================
-# BOT STATUS
-# ============================================================
-
-def get_bot_config():
-    """Read bot configuration from Supabase."""
-
-    try:
-        response = (
-            supabase.table("bot_status")
-            .select("*")
-            .eq("id", 1)
-            .limit(1)
-            .execute()
-        )
-
-        if response.data:
-            return response.data[0]
-
-        log_event(
-            "No bot_status row found with id=1.",
-            "WARNING",
-        )
-
-    except Exception as exc:
-        log_event(
-            f"Unable to read bot_status: {exc}",
-            "ERROR",
-        )
-
-    return {}
+        logger.error("Supabase logging failed: %s", exc)
 
 
 def update_bot_status(message, error=None):
-    """Update status columns that exist in the database."""
-
     try:
-        response = (
+        result = (
             supabase.table("bot_status")
             .select("*")
             .eq("id", 1)
@@ -167,33 +128,31 @@ def update_bot_status(message, error=None):
             .execute()
         )
 
-        if not response.data:
+        rows = result.data or []
+
+        if not rows:
             log_event(
-                "Cannot update status: bot_status id=1 is missing.",
                 "WARNING",
+                "No bot_status row with id=1 was found.",
             )
             return
 
-        existing_row = response.data[0]
+        existing = rows[0]
         now = datetime.now(timezone.utc).isoformat()
+
+        updates = {}
 
         possible_values = {
             "status_message": message,
             "last_heartbeat": now,
             "updated_at": now,
             "last_scan": now,
+            "last_error": error,
         }
 
-        if "last_error" in existing_row:
-            possible_values["last_error"] = (
-                str(error)[:1000] if error else None
-            )
-
-        updates = {
-            key: value
-            for key, value in possible_values.items()
-            if key in existing_row
-        }
+        for column, value in possible_values.items():
+            if column in existing:
+                updates[column] = value
 
         if updates:
             (
@@ -204,490 +163,431 @@ def update_bot_status(message, error=None):
             )
 
     except Exception as exc:
-        logger.error(
-            "Unable to update bot status: %s",
-            exc,
-        )
+        logger.error("Could not update bot status: %s", exc)
+
+
+def get_bot_config():
+    result = (
+        supabase.table("bot_status")
+        .select("*")
+        .eq("id", 1)
+        .limit(1)
+        .execute()
+    )
+
+    rows = result.data or []
+
+    return rows[0] if rows else {}
 
 
 # ============================================================
-# ALPACA ASSET DISCOVERY
+# ALPACA HTTP HELPERS
+# ============================================================
+
+def alpaca_get(url, params=None):
+    response = session.get(
+        url,
+        params=params,
+        timeout=REQUEST_TIMEOUT,
+    )
+
+    if response.status_code == 429:
+        raise RuntimeError(
+            "Alpaca rate limit reached. The next scan will retry."
+        )
+
+    response.raise_for_status()
+
+    return response.json()
+
+
+# ============================================================
+# LOAD STOCK UNIVERSE
 # ============================================================
 
 def get_all_eligible_stocks():
-    """
-    Retrieve eligible U.S. equity assets using Alpaca's raw
-    HTTP response instead of SDK Asset model validation.
+    url = f"{ALPACA_BASE_URL}/v2/assets"
 
-    This avoids a whole-list validation failure when Alpaca
-    returns an exchange value unknown to the installed SDK.
-    """
-
-    log_event("Refreshing eligible stock universe.")
-
-    headers = {
-        "APCA-API-KEY-ID": ALPACA_API_KEY,
-        "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
-    }
-
-    params = {
-        "status": "active",
-        "asset_class": "us_equity",
-    }
-
-    try:
-        response = requests.get(
-            ALPACA_ASSETS_URL,
-            headers=headers,
-            params=params,
-            timeout=60,
-        )
-
-        response.raise_for_status()
-        assets = response.json()
-
-    except requests.RequestException as exc:
-        log_event(
-            f"Alpaca asset request failed: {exc}",
-            "ERROR",
-        )
-        raise
-
-    if not isinstance(assets, list):
-        raise RuntimeError(
-            "Unexpected response from Alpaca assets endpoint."
-        )
+    data = alpaca_get(
+        url,
+        params={
+            "status": "active",
+            "asset_class": "us_equity",
+        },
+    )
 
     symbols = []
-    skipped = 0
 
-    # Use only exchanges recognized by the installed SDK.
-    # Unknown exchange names are skipped, never relabeled.
-    supported_exchanges = {
-        "AMEX",
-        "ARCA",
-        "ASCX",
-        "BATS",
-        "NYSE",
-        "NASDAQ",
-        "NYSEARCA",
-        "FTXU",
-        "CBSE",
-        "GNSS",
-        "ERSX",
-        "OTC",
-        "CRYPTO",
-        "",
-    }
+    for asset in data:
+        symbol = asset.get("symbol", "")
 
-    for asset in assets:
-        try:
-            if asset.get("class") != "us_equity":
-                continue
-
-            if asset.get("status") != "active":
-                continue
-
-            if asset.get("tradable") is not True:
-                continue
-
-            symbol = asset.get("symbol", "")
-            exchange = asset.get("exchange", "")
-
-            if not isinstance(symbol, str) or not symbol:
-                skipped += 1
-                continue
-
-            # Skip symbols containing punctuation, such as
-            # some preferred-stock and share-class tickers.
-            if not symbol.isalnum():
-                continue
-
-            if exchange not in supported_exchanges:
-                skipped += 1
-                continue
-
-            symbols.append(symbol)
-
-        except (AttributeError, TypeError):
-            skipped += 1
+        if not symbol:
             continue
+
+        if asset.get("status") != "active":
+            continue
+
+        if asset.get("tradable") is not True:
+            continue
+
+        # Avoid unusual symbol formats that may be incompatible
+        # with data providers or common stock symbols.
+        if not symbol.replace(".", "").isalnum():
+            continue
+
+        symbols.append(symbol)
 
     symbols = sorted(set(symbols))
 
     log_event(
-        f"Stock universe refreshed: {len(symbols)} eligible "
-        f"symbols; {skipped} assets skipped."
+        "INFO",
+        f"Loaded {len(symbols)} active tradable stock symbols.",
     )
-
-    if not symbols:
-        raise RuntimeError(
-            "No eligible stocks found in Alpaca asset response."
-        )
 
     return symbols
 
 
 # ============================================================
-# TECHNICAL INDICATORS
+# BATCH STOCK BARS
 # ============================================================
 
-def calculate_rsi(series, period=14):
-    """Calculate the Relative Strength Index."""
-
-    delta = series.diff()
-
-    gains = delta.clip(lower=0)
-    losses = -delta.clip(upper=0)
-
-    average_gain = gains.ewm(
-        alpha=1 / period,
-        min_periods=period,
-        adjust=False,
-    ).mean()
-
-    average_loss = losses.ewm(
-        alpha=1 / period,
-        min_periods=period,
-        adjust=False,
-    ).mean()
-
-    relative_strength = (
-        average_gain
-        / average_loss.replace(0, float("nan"))
-    )
-
-    rsi = 100 - (100 / (1 + relative_strength))
-
-    # A continuously rising series can have zero average losses.
-    # Its RSI should be 100 rather than missing.
-    rsi = rsi.mask(
-        (average_loss == 0) & (average_gain > 0),
-        100.0,
-    )
-
-    # A flat series with no gains or losses receives neutral RSI.
-    rsi = rsi.mask(
-        (average_loss == 0) & (average_gain == 0),
-        50.0,
-    )
-
-    return rsi
-
-
-# ============================================================
-# STOCK ANALYSIS
-# ============================================================
-
-def analyze_stock(symbol):
+def get_stock_bars(symbols, timeframe, start, end, limit=10000):
     """
-    Analyze recent daily price history.
-
-    Generates signals only. Never submits orders.
+    Download bars in batches from Alpaca's market-data API.
+    Supports pagination through next_page_token.
     """
 
-    try:
-        data = yf.download(
-            symbol,
-            period="6mo",
-            interval="1d",
-            progress=False,
-            auto_adjust=True,
-            threads=False,
-            timeout=20,
-        )
+    all_bars = {}
 
-        if data is None or data.empty:
-            return {
-                "symbol": symbol,
-                "signal": "NO_DATA",
+    for offset in range(0, len(symbols), BATCH_SIZE):
+        batch = symbols[offset:offset + BATCH_SIZE]
+        page_token = None
+
+        while True:
+            params = {
+                "symbols": ",".join(batch),
+                "timeframe": timeframe,
+                "start": start,
+                "end": end,
+                "limit": limit,
+                "feed": DATA_FEED,
+                "adjustment": "raw",
             }
 
-        # Normalize yfinance's possible MultiIndex columns.
-        if isinstance(data.columns, pd.MultiIndex):
-            data.columns = data.columns.get_level_values(0)
+            if page_token:
+                params["page_token"] = page_token
 
-        if not {"Close", "Volume"}.issubset(data.columns):
-            return {
-                "symbol": symbol,
-                "signal": "INVALID_DATA",
-            }
+            data = alpaca_get(
+                f"{ALPACA_DATA_URL}/v2/stocks/bars",
+                params=params,
+            )
 
-        close = pd.to_numeric(
-            data["Close"],
-            errors="coerce",
-        ).dropna()
+            for symbol, bars in data.get("bars", {}).items():
+                all_bars.setdefault(symbol, []).extend(bars)
 
-        volume = pd.to_numeric(
-            data["Volume"],
-            errors="coerce",
-        ).dropna()
+            page_token = data.get("next_page_token")
 
-        if len(close) < 50 or len(volume) < 20:
-            return {
-                "symbol": symbol,
-                "signal": "INSUFFICIENT_HISTORY",
-            }
-
-        last_price = float(close.iloc[-1])
-        average_volume = float(volume.tail(20).mean())
-
-        sma20 = float(close.tail(20).mean())
-        sma50 = float(close.tail(50).mean())
-
-        rsi_series = calculate_rsi(close)
-
-        if rsi_series.empty or pd.isna(rsi_series.iloc[-1]):
-            return {
-                "symbol": symbol,
-                "signal": "INVALID_INDICATORS",
-            }
-
-        rsi_value = float(rsi_series.iloc[-1])
-
-        indicator_values = [
-            last_price,
-            average_volume,
-            sma20,
-            sma50,
-            rsi_value,
-        ]
-
-        if not all(
-            math.isfinite(value)
-            for value in indicator_values
-        ):
-            return {
-                "symbol": symbol,
-                "signal": "INVALID_INDICATORS",
-            }
-
-        if last_price < MIN_PRICE:
-            signal = "FILTERED_LOW_PRICE"
-
-        elif average_volume < MIN_AVERAGE_VOLUME:
-            signal = "FILTERED_LOW_VOLUME"
-
-        elif (
-            last_price > sma20 > sma50
-            and 40 <= rsi_value <= 65
-        ):
-            signal = "BUY_SIGNAL"
-
-        elif last_price < sma20 < sma50:
-            signal = "SELL_SIGNAL"
-
-        else:
-            signal = "HOLD"
-
-        return {
-            "symbol": symbol,
-            "signal": signal,
-            "price": round(last_price, 4),
-            "sma20": round(sma20, 4),
-            "sma50": round(sma50, 4),
-            "rsi": round(rsi_value, 2),
-            "average_volume": int(average_volume),
-        }
-
-    except Exception as exc:
-        return {
-            "symbol": symbol,
-            "signal": "ERROR",
-            "error": str(exc)[:500],
-        }
-
-
-# ============================================================
-# RECORD SCAN RESULTS
-# ============================================================
-
-def record_result(result):
-    """Record important scanner outcomes."""
-
-    symbol = result.get("symbol", "UNKNOWN")
-    signal = result.get("signal", "UNKNOWN")
-
-    if signal == "ERROR":
-        log_event(
-            f"Analysis failed for {symbol}: "
-            f"{result.get('error', 'Unknown error')}",
-            "WARNING",
-        )
-        return
-
-    if signal in ("BUY_SIGNAL", "SELL_SIGNAL"):
-        log_event(
-            f"{signal} {symbol} | "
-            f"Price={result.get('price')} | "
-            f"SMA20={result.get('sma20')} | "
-            f"SMA50={result.get('sma50')} | "
-            f"RSI={result.get('rsi')}"
-        )
-
-
-# ============================================================
-# MARKET SCANNER
-# ============================================================
-
-def run_market_scan(symbols):
-    """
-    Scan eligible symbols sequentially in batches.
-
-    Yahoo Finance may throttle or fail some requests.
-    Individual symbol errors do not stop the full scan.
-    """
-
-    total = len(symbols)
-
-    if total == 0:
-        log_event(
-            "No eligible stocks available to scan.",
-            "WARNING",
-        )
-        return
-
-    log_event(
-        f"Starting market scan for {total} eligible symbols."
-    )
-
-    scanned = 0
-    signals = 0
-    errors = 0
-
-    for start in range(0, total, BATCH_SIZE):
-        batch = symbols[start:start + BATCH_SIZE]
-
-        for symbol in batch:
-            result = analyze_stock(symbol)
-            scanned += 1
-
-            if result.get("signal") in (
-                "BUY_SIGNAL",
-                "SELL_SIGNAL",
-            ):
-                signals += 1
-
-            if result.get("signal") == "ERROR":
-                errors += 1
-
-            record_result(result)
+            if not page_token:
+                break
 
             time.sleep(REQUEST_DELAY_SECONDS)
 
-        log_event(
-            f"Scan progress: {scanned}/{total} symbols; "
-            f"signals={signals}; errors={errors}."
-        )
+        time.sleep(REQUEST_DELAY_SECONDS)
 
-    log_event(
-        f"Market scan complete. "
-        f"Scanned={scanned}; "
-        f"signals={signals}; "
-        f"errors={errors}."
-    )
+    return all_bars
 
 
 # ============================================================
-# MAIN WORKER
+# DAILY CANDIDATE FILTER
+# ============================================================
+
+def find_daily_candidates(symbols):
+    now = datetime.now(timezone.utc)
+
+    start = (now - timedelta(days=45)).isoformat()
+    end = now.isoformat()
+
+    log_event(
+        "INFO",
+        f"Downloading daily bars for {len(symbols)} symbols.",
+    )
+
+    bars_by_symbol = get_stock_bars(
+        symbols=symbols,
+        timeframe="1Day",
+        start=start,
+        end=end,
+    )
+
+    candidates = []
+
+    for symbol, bars in bars_by_symbol.items():
+        try:
+            if len(bars) < 22:
+                continue
+
+            bars = sorted(bars, key=lambda bar: bar["t"])
+
+            previous_bar = bars[-2]
+            latest_bar = bars[-1]
+
+            price = float(latest_bar["c"])
+            previous_close = float(previous_bar["c"])
+
+            if price < MIN_PRICE or price > MAX_PRICE:
+                continue
+
+            if previous_close <= 0:
+                continue
+
+            daily_move = (
+                (price - previous_close)
+                / previous_close
+            ) * 100
+
+            recent_bars = bars[-21:-1]
+
+            dollar_volumes = [
+                float(bar["c"]) * float(bar["v"])
+                for bar in recent_bars
+            ]
+
+            average_dollar_volume = (
+                sum(dollar_volumes) / len(dollar_volumes)
+                if dollar_volumes else 0
+            )
+
+            if average_dollar_volume < MIN_AVERAGE_DOLLAR_VOLUME:
+                continue
+
+            if daily_move < MIN_DAILY_MOVE_PERCENT:
+                continue
+
+            candidates.append({
+                "symbol": symbol,
+                "price": price,
+                "daily_move_percent": daily_move,
+                "average_dollar_volume": average_dollar_volume,
+            })
+
+        except (KeyError, TypeError, ValueError, ZeroDivisionError):
+            continue
+
+    candidates.sort(
+        key=lambda item: (
+            item["daily_move_percent"],
+            item["average_dollar_volume"],
+        ),
+        reverse=True,
+    )
+
+    candidates = candidates[:MAX_CANDIDATES]
+
+    log_event(
+        "INFO",
+        f"Daily filter selected {len(candidates)} candidates.",
+    )
+
+    return candidates
+
+
+# ============================================================
+# INTRADAY BREAKOUT CHECK
+# ============================================================
+
+def check_intraday_breakouts(candidates):
+    if not candidates:
+        return []
+
+    symbols = [item["symbol"] for item in candidates]
+
+    now = datetime.now(timezone.utc)
+    start = (now - timedelta(hours=6)).isoformat()
+    end = now.isoformat()
+
+    bars_by_symbol = get_stock_bars(
+        symbols=symbols,
+        timeframe="1Min",
+        start=start,
+        end=end,
+    )
+
+    signals = []
+
+    for candidate in candidates:
+        symbol = candidate["symbol"]
+
+        bars = bars_by_symbol.get(symbol, [])
+        bars = sorted(bars, key=lambda bar: bar["t"])
+
+        # Need 20 completed comparison bars plus the latest bar.
+        if len(bars) < BREAKOUT_LOOKBACK_BARS + 1:
+            continue
+
+        previous_bars = bars[-(BREAKOUT_LOOKBACK_BARS + 1):-1]
+        latest = bars[-1]
+
+        previous_high = max(
+            float(bar["h"]) for bar in previous_bars
+        )
+
+        previous_volumes = [
+            float(bar["v"]) for bar in previous_bars
+        ]
+
+        average_volume = (
+            sum(previous_volumes) / len(previous_volumes)
+        )
+
+        latest_close = float(latest["c"])
+        latest_volume = float(latest["v"])
+
+        if average_volume <= 0:
+            continue
+
+        relative_volume = latest_volume / average_volume
+
+        if latest_close <= previous_high:
+            continue
+
+        if relative_volume < MIN_RELATIVE_VOLUME:
+            continue
+
+        signal = {
+            "symbol": symbol,
+            "signal": "BREAKOUT_CANDIDATE",
+            "price": round(latest_close, 4),
+            "breakout_level": round(previous_high, 4),
+            "relative_volume": round(relative_volume, 2),
+            "daily_move_percent": round(
+                candidate["daily_move_percent"], 2
+            ),
+            "average_dollar_volume": round(
+                candidate["average_dollar_volume"], 2
+            ),
+            "bar_time": latest.get("t"),
+        }
+
+        signals.append(signal)
+
+    return signals
+
+
+# ============================================================
+# SAVE RESULTS
+# ============================================================
+
+def record_signal(signal):
+    message = (
+        f"{signal['signal']} {signal['symbol']} | "
+        f"Price=${signal['price']:.4f} | "
+        f"Breakout=${signal['breakout_level']:.4f} | "
+        f"Relative volume={signal['relative_volume']:.2f}x | "
+        f"Daily move={signal['daily_move_percent']:.2f}%"
+    )
+
+    log_event("INFO", message)
+
+
+# ============================================================
+# ONE COMPLETE SCAN
+# ============================================================
+
+def run_market_scan(symbols):
+    candidates = find_daily_candidates(symbols)
+
+    signals = check_intraday_breakouts(candidates)
+
+    if not signals:
+        log_event(
+            "INFO",
+            "Scan complete. No qualifying breakout candidates.",
+        )
+    else:
+        for signal in signals:
+            record_signal(signal)
+
+        log_event(
+            "INFO",
+            f"Scan complete. Found {len(signals)} breakout candidates.",
+        )
+
+    return len(signals)
+
+
+# ============================================================
+# MAIN LOOP
 # ============================================================
 
 def main():
+    global stock_symbols, last_asset_refresh
+
     log_event(
-        "Stock scanner starting. "
-        "Alpaca paper mode enabled. "
-        "Automatic order execution disabled."
+        "INFO",
+        "Momentum breakout scanner starting. "
+        "Signal-only mode; no orders will be submitted.",
     )
-
-    update_bot_status(
-        "Starting broad-market stock scanner."
-    )
-
-    symbols = []
-    last_asset_refresh = 0
 
     while True:
         try:
             config = get_bot_config()
 
-            enabled = config.get("enabled") is True
-            mode = str(config.get("mode", "paper")).lower()
-
-            if not enabled:
-                update_bot_status(
-                    "Paused: bot_status.enabled is not true."
-                )
-                time.sleep(30)
+            if config.get("enabled") is not True:
+                update_bot_status("Scanner disabled in bot_status.")
+                time.sleep(60)
                 continue
+
+            mode = str(config.get("mode", "paper")).lower()
 
             if mode != "paper":
                 update_bot_status(
-                    "Stopped: only paper mode is allowed."
+                    "Scanner stopped: mode must be paper.",
+                    error="Unsafe mode configuration",
                 )
-
                 log_event(
-                    "Safety stop: bot mode is not paper.",
                     "ERROR",
+                    "Mode is not paper. No scan performed.",
                 )
-
                 time.sleep(60)
                 continue
 
-            now = time.time()
+            now_seconds = time.time()
 
             if (
-                not symbols
-                or now - last_asset_refresh
+                not stock_symbols
+                or now_seconds - last_asset_refresh
                 >= ASSET_REFRESH_SECONDS
             ):
-                refreshed_symbols = get_all_eligible_stocks()
+                stock_symbols = get_all_eligible_stocks()
+                last_asset_refresh = now_seconds
 
-                # Update the cache only after a successful refresh.
-                symbols = refreshed_symbols
-                last_asset_refresh = time.time()
-
-            if not symbols:
-                update_bot_status(
-                    "No eligible stocks found."
+            if not stock_symbols:
+                raise RuntimeError(
+                    "No eligible stock symbols were returned by Alpaca."
                 )
-                time.sleep(60)
-                continue
 
-            account = alpaca.get_account()
+            update_bot_status("Scanning for momentum breakouts.")
 
-            log_event(
-                f"Paper account connected. "
-                f"Equity={account.equity}; "
-                f"Buying power={account.buying_power}."
-            )
+            signal_count = run_market_scan(stock_symbols)
 
             update_bot_status(
-                f"Scanning {len(symbols)} eligible stocks. "
-                "Paper mode; orders disabled."
+                f"Scan complete. {signal_count} breakout candidates found."
             )
-
-            run_market_scan(symbols)
-
-            update_bot_status(
-                f"Last scan completed. "
-                f"Universe size={len(symbols)}. "
-                "Orders disabled."
-            )
-
-            time.sleep(SCAN_INTERVAL_SECONDS)
 
         except Exception as exc:
-            log_event(
-                f"Worker cycle failed: {exc}",
-                "ERROR",
-            )
+            logger.exception("Scanner cycle failed.")
 
             update_bot_status(
-                "Worker encountered an error.",
-                error=str(exc),
+                "Scanner cycle failed.",
+                error=str(exc)[:1000],
             )
 
-            time.sleep(60)
+            log_event(
+                "ERROR",
+                f"Scanner cycle failed: {exc}",
+            )
+
+        time.sleep(SCAN_INTERVAL_SECONDS)
 
 
 if __name__ == "__main__":
