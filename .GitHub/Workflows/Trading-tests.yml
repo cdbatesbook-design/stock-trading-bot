@@ -22,8 +22,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pandas numpy
-          pip install alpaca-py supabase
+          pip install pandas numpy alpaca-py supabase
 
       - name: Check Python syntax
         run: |
@@ -32,11 +31,144 @@ jobs:
           python -m compileall -q strategy_selector.py
           python -m compileall -q multi_theory_worker.py
 
-      - name: Check strategy imports
+      - name: Check imports
         run: |
-          python -c "from strategies import evaluate_all, evaluate_strategy_by_id; print('Strategy imports passed')"
-          python -c "from risk_manager import calculate_position_size, RiskConfig; print('Risk manager imports passed')"
-          python -c "from strategy_selector import rank_strategies, SelectorConfig; print('Strategy selector imports passed')"
+          python -c "from strategies import evaluate_all, evaluate_strategy_by_id"
+          python -c "from risk_manager import calculate_position_size, RiskConfig, check_position_limit, validate_portfolio"
+          python -c "from strategy_selector import rank_strategies, SelectorConfig"
+          echo "Imports passed."
+
+      - name: Test risk manager
+        run: |
+          python - <<'PY'
+          import math
+          from risk_manager import (
+              RiskConfig,
+              calculate_position_size,
+              check_position_limit,
+              validate_portfolio,
+          )
+
+          def check(condition, message):
+              if not condition:
+                  raise AssertionError(message)
+              print("PASS:", message)
+
+          # 1. Default maximum of three simultaneous positions.
+          cfg = RiskConfig()
+          check(cfg.max_positions == 3, "Default limit is three positions")
+          check(check_position_limit(0, cfg), "Zero positions allows consideration")
+          check(check_position_limit(2, cfg), "Two positions allows consideration")
+          check(not check_position_limit(3, cfg), "Three positions blocks another")
+          check(not check_position_limit(-1, cfg), "Negative position count rejected")
+
+          # 2. Risk-limited position sizing.
+          plan = calculate_position_size(
+              account_equity=500,
+              available_cash=500,
+              entry_price=100,
+              stop_price=95,
+              open_positions=0,
+          )
+          check(plan.approved, "Valid trade plan approved")
+          check(plan.quantity > 0, "Approved plan has positive quantity")
+          check(plan.risk_amount <= 5.00, "Planned risk does not exceed 1% of $500")
+          check(plan.estimated_cost <= 475.00, "Cash reserve respected")
+          check(plan.estimated_cost <= 250.00, "Maximum position fraction respected")
+
+          # 3. Fractional shares allow a small affordable position.
+          fractional = calculate_position_size(
+              account_equity=500,
+              available_cash=100,
+              entry_price=1000,
+              stop_price=990,
+              open_positions=0,
+              config=RiskConfig(min_order_value=1.0, fractional_shares=True),
+          )
+          check(fractional.approved, "Affordable fractional position approved")
+          check(0 < fractional.quantity < 1, "Fractional quantity is below one share")
+          check(fractional.estimated_cost <= 95.00, "Fractional trade respects cash reserve")
+
+          # 4. Whole-share mode never returns fractional quantity.
+          whole = calculate_position_size(
+              account_equity=500,
+              available_cash=500,
+              entry_price=100,
+              stop_price=95,
+              open_positions=0,
+              config=RiskConfig(fractional_shares=False),
+          )
+          check(
+              (not whole.approved) or whole.quantity.is_integer(),
+              "Whole-share mode never approves fractional quantity",
+          )
+
+          # 5. Three existing positions blocks a new trade.
+          blocked = calculate_position_size(
+              account_equity=500,
+              available_cash=500,
+              entry_price=20,
+              stop_price=19,
+              open_positions=3,
+          )
+          check(not blocked.approved, "Fourth position is rejected")
+
+          # 6. Invalid stop prices are rejected.
+          bad_stop = calculate_position_size(
+              account_equity=500,
+              available_cash=500,
+              entry_price=20,
+              stop_price=21,
+              open_positions=0,
+          )
+          check(not bad_stop.approved, "Stop above entry is rejected")
+
+          # 7. Invalid market data is rejected.
+          for bad_price in (0, -1, float("nan"), float("inf")):
+              invalid = calculate_position_size(
+                  account_equity=500,
+                  available_cash=500,
+                  entry_price=bad_price,
+                  stop_price=1,
+                  open_positions=0,
+              )
+              check(not invalid.approved, f"Invalid entry price {bad_price} rejected")
+
+          # 8. Invalid risk configuration is rejected.
+          invalid_cfg = RiskConfig(risk_per_trade=2.0)
+          invalid_config_plan = calculate_position_size(
+              account_equity=500,
+              available_cash=500,
+              entry_price=20,
+              stop_price=19,
+              open_positions=0,
+              config=invalid_cfg,
+          )
+          check(not invalid_config_plan.approved, "Risk fraction above 100% rejected")
+
+          # 9. Portfolio warnings detect too many positions.
+          warnings = validate_portfolio(
+              account_equity=500,
+              available_cash=100,
+              open_positions=4,
+          )
+          check(any("exceeding" in warning for warning in warnings),
+                "Portfolio validator detects excess positions")
+
+          # 10. Approved plans can carry the stock symbol.
+          identified = calculate_position_size(
+              account_equity=500,
+              available_cash=500,
+              entry_price=20,
+              stop_price=19,
+              open_positions=0,
+              symbol="EDAC",
+          )
+          check(identified.approved, "Valid symbol trade plan approved")
+          check(identified.symbol == "EDAC", "Trade plan retains stock symbol")
+
+          print("All risk manager tests passed.")
+          PY
 
       - name: Check all 11 strategies
         run: |
@@ -86,8 +218,5 @@ jobs:
 
           print("All 11 strategy results returned successfully.")
           for result in results:
-              print(
-                  f"{result.strategy_id}: "
-                  f"{result.action} - {result.reason}"
-              )
+              print(f"{result.strategy_id}: {result.action} - {result.reason}")
           PY
