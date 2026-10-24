@@ -16,7 +16,8 @@ from supabase import create_client
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderSide, TimeInForce
 from alpaca.trading.requests import MarketOrderRequest
-from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.historical import StockHisto
+ricalDataClient
 from alpaca.data.requests import StockLatestTradeRequest
 
 # ---- Conservative settings ----
