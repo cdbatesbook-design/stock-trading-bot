@@ -1,70 +1,60 @@
+"""One-minute momentum research backtest. PAPER/RESEARCH ONLY: never submits orders.
+
+Tests 0.50%, 0.75%, 1.00%, and 1.50% profit targets with a 1% stop from
+entry fill, 5% equity/buying-power allocation per position, fractional shares,
+slippage, cash accounting, and mark-to-market portfolio drawdown.
+
+This is a research backtest, not a live trading bot. It intentionally does not
+place orders or change the existing backtest.py / worker.py files.
+"""
+from __future__ import annotations
+
+import logging
+import math
 import os
 import time
-import math
-import logging
 import uuid
+from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone, time as dt_time
 from zoneinfo import ZoneInfo
 
 import requests
 
-# ============================================================
-# CONFIGURATION
-# ============================================================
-
-ALPACA_KEY = os.getenv("APCA_API_KEY_ID")
-ALPACA_SECRET = os.getenv("APCA_API_SECRET_KEY")
-
+# ---------------------------- configuration ----------------------------
+ALPACA_KEY = os.getenv("APCA_API_KEY_ID") or os.getenv("ALPACA_API_KEY")
+ALPACA_SECRET = os.getenv("APCA_API_SECRET_KEY") or os.getenv("ALPACA_SECRET_KEY")
 ALPACA_DATA_URL = "https://data.alpaca.markets/v2"
 ALPACA_TRADING_URL = "https://paper-api.alpaca.markets"
-
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
-SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
 EASTERN = ZoneInfo("America/New_York")
 
-BACKTEST_DAYS = 180
-DAILY_WARMUP_DAYS = 180
-
-MAX_SYMBOLS = 100
-SYMBOL_BATCH_SIZE = 10
+BACKTEST_DAYS = int(os.getenv("BACKTEST_DAYS", "90"))
+MAX_SYMBOLS = int(os.getenv("BACKTEST_MAX_SYMBOLS", "50"))
 DAILY_BATCH_SIZE = 100
-
-STARTING_CAPITALS = [500, 1000, 2500, 5000]
-
-ORB_STRATEGIES = [5, 15, 30]
-
-MAX_POSITIONS = 3
-RISK_PER_TRADE = 0.005
-MAX_POSITION_EQUITY_PCT = 0.30
-
-SLIPPAGE_BPS = 5
-REWARD_RISK_RATIO = 2.0
-
-MIN_STOCK_PRICE = 5.00
+MIN_STOCK_PRICE = 5.0
 MIN_AVG_DOLLAR_VOLUME = 20_000_000
-MAX_ENTRY_GAP_PCT = 0.03
-
-DATA_FEED = "iex"
-
-MOMENTUM_CONFIGS = [
-    ("MOM_20D_VOL15_ATR2", 20, 1.5, 2.0),
-    ("MOM_20D_VOL10_ATR2", 20, 1.0, 2.0),
-    ("MOM_55D_VOL15_ATR2", 55, 1.5, 2.0),
-    ("MOM_20D_VOL15_ATR3", 20, 1.5, 3.0),
-]
+DATA_FEED = os.getenv("ALPACA_DATA_FEED", "iex")
+STARTING_CAPITALS = [100, 500, 1000, 2500, 5000]
+PROFIT_TARGETS = [0.005, 0.0075, 0.01, 0.015]
+STOP_LOSS_PCT = 0.01
+POSITION_ALLOCATION_PCT = 0.05
+SLIPPAGE_BPS_PER_SIDE = 5
+MAX_HOLD_MINUTES = 120
+MIN_AVG_VOLUME_MULTIPLIER = 1.2
+LOOKBACK_BARS = 20
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s: %(message)s",
 )
-
-log = logging.getLogger("stock_backtest")
+log = logging.getLogger("stock_backtest_v2")
 SESSION = requests.Session()
 
 if not ALPACA_KEY or not ALPACA_SECRET:
     raise RuntimeError(
-        "Missing APCA_API_KEY_ID or APCA_API_SECRET_KEY."
+        "Missing Alpaca credentials. Set APCA_API_KEY_ID and "
+        "APCA_API_SECRET_KEY in GitHub Actions secrets."
     )
 
 HEADERS = {
@@ -73,18 +63,9 @@ HEADERS = {
 }
 
 
-# ============================================================
-# GENERAL HELPERS
-# ============================================================
-
-def parse_timestamp(value):
-    return datetime.fromisoformat(value.replace("Z", "+00:00"))
-
-
-def iso_utc(value):
+def utc_iso(value: datetime) -> str:
     if value.tzinfo is None:
         value = value.replace(tzinfo=timezone.utc)
-
     return (
         value.astimezone(timezone.utc)
         .isoformat(timespec="seconds")
@@ -92,22 +73,39 @@ def iso_utc(value):
     )
 
 
-def request_json(url, params=None, headers=None, retries=6):
-    last_error = None
+def parse_ts(value: str) -> datetime:
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def number(value, default=0.0) -> float:
+    try:
+        out = float(value)
+        return out if math.isfinite(out) else default
+    except (TypeError, ValueError):
+        return default
+
+
+def chunks(items, size):
+    for i in range(0, len(items), size):
+        yield items[i:i + size]
+
+
+def get_json(url, params=None, retries=6):
+    last = None
 
     for attempt in range(retries):
         try:
             response = SESSION.get(
                 url,
                 params=params,
-                headers=headers or HEADERS,
+                headers=HEADERS,
                 timeout=90,
             )
 
             if response.status_code == 429 or response.status_code >= 500:
                 wait = min(60, 2 ** attempt)
                 log.warning(
-                    "HTTP %s; retrying in %s seconds.",
+                    "Alpaca HTTP %s; retrying in %ss",
                     response.status_code,
                     wait,
                 )
@@ -115,772 +113,633 @@ def request_json(url, params=None, headers=None, retries=6):
                 continue
 
             response.raise_for_status()
+            return response.json()
 
-            try:
-                return response.json()
-            except ValueError as exc:
-                raise RuntimeError(
-                    f"Invalid JSON from {url}: {response.text[:300]}"
-                ) from exc
-
-        except requests.RequestException as exc:
-            last_error = exc
-            time.sleep(min(60, 2 ** attempt))
+        except (requests.RequestException, ValueError) as exc:
+            last = exc
+            if attempt < retries - 1:
+                time.sleep(min(60, 2 ** attempt))
 
     raise RuntimeError(
-        f"API request failed after {retries} attempts: {last_error}"
+        f"Alpaca request failed after {retries} attempts: {last}"
     )
 
 
-def chunks(items, size):
-    for start in range(0, len(items), size):
-        yield items[start:start + size]
-
-
-def safe_float(value, default=0.0):
-    try:
-        result = float(value)
-        return result if math.isfinite(result) else default
-    except (TypeError, ValueError):
-        return default
-
-
-# ============================================================
-# HISTORICAL DATA
-# ============================================================
-
 def download_bars(symbols, timeframe, start, end):
-    if not symbols:
-        return {}
-
     collected = {symbol: [] for symbol in symbols}
+
+    if not symbols:
+        return collected
 
     params = {
         "symbols": ",".join(symbols),
         "timeframe": timeframe,
-        "start": iso_utc(start),
-        "end": iso_utc(end),
+        "start": utc_iso(start),
+        "end": utc_iso(end),
         "limit": 10000,
         "adjustment": "split",
         "feed": DATA_FEED,
         "sort": "asc",
     }
 
-    page_token = None
+    token = None
 
     while True:
         query = dict(params)
 
-        if page_token:
-            query["page_token"] = page_token
+        if token:
+            query["page_token"] = token
 
-        payload = request_json(
+        payload = get_json(
             f"{ALPACA_DATA_URL}/stocks/bars",
-            params=query,
+            query,
         )
 
         for symbol, rows in (payload.get("bars") or {}).items():
             if symbol in collected:
                 collected[symbol].extend(rows)
 
-        page_token = payload.get("next_page_token")
+        token = payload.get("next_page_token")
 
-        if not page_token:
+        if not token:
             break
 
-    for symbol in collected:
-        collected[symbol].sort(key=lambda row: row.get("t", ""))
+    for rows in collected.values():
+        rows.sort(key=lambda row: row.get("t", ""))
 
     return collected
 
 
-# ============================================================
-# STOCK UNIVERSE
-# ============================================================
+def discover_and_screen(start, end):
+    log.info("Discovering active tradable US equities")
 
-def discover_symbols():
-    log.info("Discovering active, tradable US equity assets.")
-
-    assets = request_json(
+    assets = get_json(
         f"{ALPACA_TRADING_URL}/v2/assets",
-        params={"status": "active", "asset_class": "us_equity"},
+        {
+            "status": "active",
+            "asset_class": "us_equity",
+        },
     )
 
-    symbols = []
+    symbols = sorted({
+        asset.get("symbol", "")
+        for asset in assets
+        if asset.get("status") == "active"
+        and asset.get("tradable") is True
+        and asset.get("symbol")
+        and len(asset["symbol"]) <= 6
+        and asset["symbol"].replace(".", "").isalnum()
+    })
 
-    for asset in assets:
-        symbol = asset.get("symbol", "")
+    log.info(
+        "Checking daily liquidity for %s symbols; this may take several minutes",
+        len(symbols),
+    )
 
-        if asset.get("status") != "active":
-            continue
+    qualified = []
 
-        if asset.get("tradable") is not True:
-            continue
-
-        if not symbol or len(symbol) > 6:
-            continue
-
-        if not symbol.replace(".", "").isalnum():
-            continue
-
-        symbols.append(symbol)
-
-    symbols = sorted(set(symbols))
-    log.info("Discovered %s symbols.", len(symbols))
-
-    return symbols
-
-
-def screen_universe(symbols, start, end):
-    log.info("Screening universe for price and liquidity.")
-
-    candidates = []
-
-    for batch_number, batch in enumerate(
-        chunks(symbols, DAILY_BATCH_SIZE), start=1
+    for batch_no, batch in enumerate(
+        chunks(symbols, DAILY_BATCH_SIZE),
+        1,
     ):
-        daily = download_bars(batch, "1Day", start, end)
+        daily = download_bars(
+            batch,
+            "1Day",
+            start - timedelta(days=45),
+            end,
+        )
 
         for symbol, rows in daily.items():
             if len(rows) < 20:
                 continue
 
             recent = rows[-20:]
-            last_close = safe_float(recent[-1].get("c"))
+            close = number(recent[-1].get("c"))
 
-            if last_close < MIN_STOCK_PRICE:
-                continue
-
-            avg_dollar_volume = sum(
-                safe_float(row.get("c")) * safe_float(row.get("v"))
+            avg_dv = sum(
+                number(row.get("c")) * number(row.get("v"))
                 for row in recent
             ) / len(recent)
 
-            if avg_dollar_volume >= MIN_AVG_DOLLAR_VOLUME:
-                candidates.append({
-                    "symbol": symbol,
-                    "price": last_close,
-                    "avg_dollar_volume": avg_dollar_volume,
-                })
+            if (
+                close >= MIN_STOCK_PRICE
+                and avg_dv >= MIN_AVG_DOLLAR_VOLUME
+            ):
+                qualified.append((symbol, avg_dv))
 
-        log.info(
-            "Screening batch %s complete; %s candidates qualify.",
-            batch_number,
-            len(candidates),
-        )
+        if batch_no % 10 == 0:
+            log.info(
+                "Liquidity screen batches: %s; qualified so far: %s",
+                batch_no,
+                len(qualified),
+            )
 
-    candidates.sort(
-        key=lambda item: item["avg_dollar_volume"],
-        reverse=True,
-    )
+    qualified.sort(key=lambda item: item[1], reverse=True)
 
-    selected = candidates[:MAX_SYMBOLS]
+    selected = [
+        symbol
+        for symbol, _ in qualified[:MAX_SYMBOLS]
+    ]
+
+    if "SPY" not in selected:
+        selected.append("SPY")
 
     log.info(
-        "Selected %s stocks from %s qualifying stocks.",
+        "Selected %s symbols including SPY benchmark",
         len(selected),
-        len(candidates),
     )
 
-    return [item["symbol"] for item in selected]
+    return selected
 
 
-# ============================================================
-# OPENING-RANGE BREAKOUT
-# ============================================================
+def regular_session(row):
+    ts = parse_ts(row["t"]).astimezone(EASTERN)
 
-def regular_session_by_day(rows):
-    by_day = {}
+    return (
+        ts.weekday() < 5
+        and dt_time(9, 30) <= ts.time() < dt_time(16, 0)
+    )
+
+
+def build_signal_flags(rows):
+    """Build completed-bar signals without using future data."""
+
+    parsed = []
+    ema9 = None
+    ema21 = None
+
+    alpha9 = 2 / 10
+    alpha21 = 2 / 22
+
+    session_date = None
+    cumulative_pv = 0.0
+    cumulative_volume = 0.0
+
+    vol_window = deque(maxlen=LOOKBACK_BARS)
+    high_window = deque(maxlen=LOOKBACK_BARS)
+    flags = []
 
     for row in rows:
-        timestamp = parse_timestamp(row["t"])
-        local = timestamp.astimezone(EASTERN)
-
-        if local.weekday() >= 5:
-            continue
-
-        if not (
-            dt_time(9, 30) <= local.time() < dt_time(16, 0)
-        ):
-            continue
-
-        by_day.setdefault(local.date(), []).append({
-            "timestamp": timestamp,
-            "open": safe_float(row.get("o")),
-            "high": safe_float(row.get("h")),
-            "low": safe_float(row.get("l")),
-            "close": safe_float(row.get("c")),
-            "volume": safe_float(row.get("v")),
-        })
-
-    for day in by_day:
-        by_day[day].sort(key=lambda bar: bar["timestamp"])
-
-    return by_day
-
-
-def generate_orb_candidates(symbol, rows, opening_minutes):
-    candidates = []
-
-    for trading_day, bars in regular_session_by_day(rows).items():
-        if len(bars) <= opening_minutes:
-            continue
-
-        opening_bars = bars[:opening_minutes]
-
-        range_high = max(bar["high"] for bar in opening_bars)
-        range_low = min(bar["low"] for bar in opening_bars)
-
-        if range_high <= range_low:
-            continue
-
-        signal_index = None
-
-        for index in range(opening_minutes, len(bars) - 1):
-            if bars[index]["close"] > range_high:
-                signal_index = index
-                break
-
-        if signal_index is None:
-            continue
-
-        entry_bar = bars[signal_index + 1]
-        entry_price = entry_bar["open"]
-        stop_price = range_low
-
-        if entry_price <= stop_price or entry_price <= 0:
-            continue
-
-        target_price = (
-            entry_price
-            + REWARD_RISK_RATIO * (entry_price - stop_price)
-        )
-
-        exit_price = None
-        exit_time = None
-        exit_reason = None
-
-        for bar in bars[signal_index + 1:]:
-            if bar["open"] <= stop_price:
-                exit_price = bar["open"]
-                exit_time = bar["timestamp"]
-                exit_reason = "STOP_GAP"
-                break
-
-            if bar["open"] >= target_price:
-                exit_price = target_price
-                exit_time = bar["timestamp"]
-                exit_reason = "TARGET"
-                break
-
-            hit_stop = bar["low"] <= stop_price
-            hit_target = bar["high"] >= target_price
-
-            if hit_stop:
-                exit_price = stop_price
-                exit_time = bar["timestamp"]
-                exit_reason = (
-                    "STOP_AMBIGUOUS" if hit_target else "STOP"
-                )
-                break
-
-            if hit_target:
-                exit_price = target_price
-                exit_time = bar["timestamp"]
-                exit_reason = "TARGET"
-                break
-
-        if exit_price is None:
-            last_bar = bars[-1]
-            exit_price = last_bar["close"]
-            exit_time = last_bar["timestamp"]
-            exit_reason = "SESSION_CLOSE"
-
-        candidates.append({
-            "symbol": symbol,
-            "trading_day": str(trading_day),
-            "entry_time": entry_bar["timestamp"],
-            "exit_time": exit_time,
-            "entry_price": entry_price,
-            "exit_price": exit_price,
-            "stop_price": stop_price,
-            "target_price": target_price,
-            "exit_reason": exit_reason,
-            "strategy_type": f"ORB_{opening_minutes}M",
-        })
-
-    return candidates
-
-
-# ============================================================
-# DAILY INDICATORS / MOMENTUM
-# ============================================================
-
-def prepare_daily_bars(rows):
-    prepared = []
-
-    for index, row in enumerate(rows):
-        timestamp = parse_timestamp(row["t"])
+        ts = parse_ts(row["t"])
+        local = ts.astimezone(EASTERN)
 
         bar = {
-            "timestamp": timestamp,
-            "date": timestamp.astimezone(EASTERN).date(),
-            "open": safe_float(row.get("o")),
-            "high": safe_float(row.get("h")),
-            "low": safe_float(row.get("l")),
-            "close": safe_float(row.get("c")),
-            "volume": safe_float(row.get("v")),
+            "timestamp": ts,
+            "local_date": local.date(),
+            "open": number(row.get("o")),
+            "high": number(row.get("h")),
+            "low": number(row.get("l")),
+            "close": number(row.get("c")),
+            "volume": number(row.get("v")),
         }
 
-        if index >= 19:
-            bar["ma20"] = sum(
-                safe_float(x.get("c"))
-                for x in rows[index - 19:index + 1]
-            ) / 20
+        parsed.append(bar)
 
-        if index >= 49:
-            bar["ma50"] = sum(
-                safe_float(x.get("c"))
-                for x in rows[index - 49:index + 1]
-            ) / 50
-
-        if index >= 20:
-            prior20 = rows[index - 20:index]
-
-            bar["prior20_high"] = max(
-                safe_float(x.get("h")) for x in prior20
-            )
-
-            bar["prior20_volume_avg"] = sum(
-                safe_float(x.get("v")) for x in prior20
-            ) / 20
-
-            previous_close = safe_float(rows[index - 20].get("c"))
-
-            if previous_close > 0:
-                bar["return20"] = bar["close"] / previous_close - 1
-
-        if index >= 55:
-            prior55 = rows[index - 55:index]
-            bar["prior55_high"] = max(
-                safe_float(x.get("h")) for x in prior55
-            )
-
-        if index >= 14:
-            true_ranges = []
-
-            for j in range(index - 13, index + 1):
-                high = safe_float(rows[j].get("h"))
-                low = safe_float(rows[j].get("l"))
-                previous_close = safe_float(rows[j - 1].get("c"))
-
-                true_ranges.append(
-                    max(
-                        high - low,
-                        abs(high - previous_close),
-                        abs(low - previous_close),
-                    )
-                )
-
-            bar["atr14"] = sum(true_ranges) / len(true_ranges)
-
-        prepared.append(bar)
-
-    return prepared
-
-
-def generate_momentum_candidates(
-    symbol,
-    stock_rows,
-    spy_rows,
-    lookback,
-    volume_multiplier,
-    atr_multiplier,
-    test_start,
-    test_end,
-):
-    candidates = []
-
-    stock = prepare_daily_bars(stock_rows)
-    spy = prepare_daily_bars(spy_rows)
-
-    spy_by_date = {bar["date"]: bar for bar in spy}
-
-    strategy_name = (
-        f"MOM_{lookback}D_VOL"
-        f"{int(volume_multiplier * 10)}_ATR"
-        f"{int(atr_multiplier)}"
-    )
-
-    for index in range(1, len(stock) - 1):
-        signal = stock[index]
-        entry_bar = stock[index + 1]
-
-        if not (test_start <= signal["timestamp"] < test_end):
-            continue
-
-        market = spy_by_date.get(signal["date"])
-
-        if market is None:
-            continue
-
-        if signal["close"] < MIN_STOCK_PRICE or signal["close"] <= 0:
-            continue
-
-        if not all(
-            key in signal for key in ("ma20", "ma50", "atr14", "return20")
-        ):
-            continue
-
-        if not all(key in market for key in ("ma50", "return20")):
-            continue
-
-        if signal["close"] <= signal["ma20"]:
-            continue
-
-        if signal["close"] <= signal["ma50"]:
-            continue
-
-        if market["close"] <= 0 or market["close"] <= market["ma50"]:
-            continue
-
-        if signal["return20"] <= market["return20"]:
-            continue
-
-        breakout_level = (
-            signal.get("prior20_high")
-            if lookback == 20
-            else signal.get("prior55_high")
+        valid_session = (
+            local.weekday() < 5
+            and dt_time(9, 30) <= local.time() < dt_time(16, 0)
         )
-
-        if breakout_level is None or breakout_level <= 0:
-            continue
-
-        if signal["close"] <= breakout_level:
-            continue
-
-        volume_avg = signal.get("prior20_volume_avg", 0)
-
-        if volume_avg <= 0:
-            continue
-
-        if signal["volume"] < volume_multiplier * volume_avg:
-            continue
-
-        entry_price = entry_bar["open"]
-
-        if entry_price <= 0:
-            continue
-
-        if entry_price > breakout_level * (1 + MAX_ENTRY_GAP_PCT):
-            continue
-
-        atr = signal["atr14"]
-
-        if atr <= 0:
-            continue
-
-        stop_price = entry_price - atr_multiplier * atr
-
-        if stop_price <= 0 or stop_price >= entry_price:
-            continue
-
-        target_price = (
-            entry_price
-            + REWARD_RISK_RATIO * (entry_price - stop_price)
-        )
-
-        exit_price = None
-        exit_time = None
-        exit_reason = None
-
-        for future in stock[index + 1:]:
-            if future["timestamp"] >= test_end:
-                break
-
-            if future["open"] <= stop_price:
-                exit_price = future["open"]
-                exit_time = future["timestamp"]
-                exit_reason = "STOP_GAP"
-                break
-
-            if future["open"] >= target_price:
-                exit_price = target_price
-                exit_time = future["timestamp"]
-                exit_reason = "TARGET"
-                break
-
-            hit_stop = future["low"] <= stop_price
-            hit_target = future["high"] >= target_price
-
-            if hit_stop:
-                exit_price = stop_price
-                exit_time = future["timestamp"]
-                exit_reason = (
-                    "STOP_AMBIGUOUS" if hit_target else "STOP"
-                )
-                break
-
-            if hit_target:
-                exit_price = target_price
-                exit_time = future["timestamp"]
-                exit_reason = "TARGET"
-                break
-
-        if exit_price is None:
-            eligible = [
-                bar for bar in stock
-                if entry_bar["timestamp"] <= bar["timestamp"] < test_end
-            ]
-
-            if not eligible:
-                continue
-
-            last_bar = eligible[-1]
-            exit_price = last_bar["close"]
-            exit_time = last_bar["timestamp"]
-            exit_reason = "END_OF_TEST"
-
-        candidates.append({
-            "symbol": symbol,
-            "trading_day": str(signal["date"]),
-            "entry_time": entry_bar["timestamp"],
-            "exit_time": exit_time,
-            "entry_price": entry_price,
-            "exit_price": exit_price,
-            "stop_price": stop_price,
-            "target_price": target_price,
-            "exit_reason": exit_reason,
-            "strategy_type": strategy_name,
-        })
-
-    return candidates
-
-
-# ============================================================
-# SIMULATION / METRICS
-# ============================================================
-
-def simulate_strategy(candidates, starting_capital):
-    candidates = sorted(
-        candidates,
-        key=lambda item: (item["entry_time"], item["symbol"]),
-    )
-
-    cash = float(starting_capital)
-    open_positions = []
-    trades = []
-    skipped = 0
-
-    for candidate in candidates:
-        entry_time = candidate["entry_time"]
-        still_open = []
-
-        for position in open_positions:
-            if position["exit_time"] <= entry_time:
-                proceeds = (
-                    position["shares"]
-                    * position["exit_price"]
-                    * (1 - SLIPPAGE_BPS / 10000.0)
-                )
-                cash += proceeds
-                trades.append(position["trade"])
-            else:
-                still_open.append(position)
-
-        open_positions = still_open
-
-        if len(open_positions) >= MAX_POSITIONS:
-            skipped += 1
-            continue
-
-        entry_price = safe_float(candidate["entry_price"])
-        exit_price = safe_float(candidate["exit_price"])
-        stop_price = safe_float(candidate["stop_price"])
 
         if (
-            entry_price <= 0
-            or exit_price <= 0
-            or stop_price <= 0
-            or stop_price >= entry_price
+            not valid_session
+            or min(
+                bar["open"],
+                bar["high"],
+                bar["low"],
+                bar["close"],
+            ) <= 0
         ):
-            skipped += 1
+            flags.append(False)
             continue
 
-        committed = sum(
-            position["shares"] * position["entry_price"]
-            for position in open_positions
+        if session_date != local.date():
+            session_date = local.date()
+            cumulative_pv = 0.0
+            cumulative_volume = 0.0
+            vol_window.clear()
+            high_window.clear()
+            ema9 = None
+            ema21 = None
+
+        typical = (
+            bar["high"] + bar["low"] + bar["close"]
+        ) / 3
+
+        cumulative_pv += typical * bar["volume"]
+        cumulative_volume += bar["volume"]
+
+        vwap = (
+            cumulative_pv / cumulative_volume
+            if cumulative_volume > 0
+            else bar["close"]
         )
 
-        current_equity = max(0.0, cash + committed)
-        risk_budget = current_equity * RISK_PER_TRADE
-        risk_per_share = entry_price - stop_price
+        old_vols = list(vol_window)
 
-        if risk_per_share <= 0:
-            skipped += 1
-            continue
-
-        shares_by_risk = risk_budget / risk_per_share
-        shares_by_position_cap = (
-            current_equity * MAX_POSITION_EQUITY_PCT
-        ) / entry_price
-
-        entry_fill = entry_price * (1 + SLIPPAGE_BPS / 10000.0)
-        shares_by_cash = max(0.0, cash) / entry_fill
-
-        shares = min(
-            shares_by_risk,
-            shares_by_position_cap,
-            shares_by_cash,
+        prior_high = (
+            max(high_window)
+            if high_window
+            else float("inf")
         )
 
-        if not math.isfinite(shares) or shares <= 0:
-            skipped += 1
-            continue
-
-        exit_fill = exit_price * (1 - SLIPPAGE_BPS / 10000.0)
-        entry_cost = shares * entry_fill
-        cash -= entry_cost
-        pnl = shares * (exit_fill - entry_fill)
-
-        trade = {
-            "symbol": candidate["symbol"],
-            "strategy_type": candidate["strategy_type"],
-            "entry_time": entry_time,
-            "exit_time": candidate["exit_time"],
-            "entry_price": entry_fill,
-            "exit_price": exit_fill,
-            "shares": shares,
-            "pnl": pnl,
-            "return_pct": (exit_fill / entry_fill - 1) * 100,
-            "exit_reason": candidate["exit_reason"],
-        }
-
-        open_positions.append({
-            "exit_time": candidate["exit_time"],
-            "shares": shares,
-            "entry_price": entry_fill,
-            "exit_price": exit_price,
-            "trade": trade,
-        })
-
-    for position in sorted(
-        open_positions, key=lambda item: item["exit_time"]
-    ):
-        proceeds = (
-            position["shares"]
-            * position["exit_price"]
-            * (1 - SLIPPAGE_BPS / 10000.0)
+        ema9 = (
+            bar["close"]
+            if ema9 is None
+            else alpha9 * bar["close"] + (1 - alpha9) * ema9
         )
-        cash += proceeds
-        trades.append(position["trade"])
 
-    trades.sort(key=lambda trade: trade["exit_time"])
+        ema21 = (
+            bar["close"]
+            if ema21 is None
+            else alpha21 * bar["close"] + (1 - alpha21) * ema21
+        )
 
-    ending_equity = cash
-    pnl_values = [trade["pnl"] for trade in trades]
+        avg_volume = (
+            sum(old_vols) / len(old_vols)
+            if old_vols
+            else 0
+        )
 
-    wins = sum(1 for pnl in pnl_values if pnl > 0)
-    losses = sum(1 for pnl in pnl_values if pnl < 0)
+        flag = (
+            len(old_vols) == LOOKBACK_BARS
+            and bar["close"] > prior_high
+            and ema9 > ema21
+            and bar["close"] > vwap
+            and avg_volume > 0
+            and bar["volume"]
+            >= MIN_AVG_VOLUME_MULTIPLIER * avg_volume
+        )
 
-    gross_profit = sum(pnl for pnl in pnl_values if pnl > 0)
-    gross_loss = abs(sum(pnl for pnl in pnl_values if pnl < 0))
+        flags.append(flag)
 
-    if gross_loss > 0:
-        profit_factor = gross_profit / gross_loss
-    elif gross_profit > 0:
-        profit_factor = float("inf")
-    else:
-        profit_factor = 0.0
+        vol_window.append(bar["volume"])
+        high_window.append(bar["high"])
 
-    equity = float(starting_capital)
-    peak = equity
-    max_drawdown = 0.0
+    return parsed, flags
 
-    for trade in trades:
-        equity += trade["pnl"]
-        peak = max(peak, equity)
 
-        if peak > 0:
-            max_drawdown = max(
-                max_drawdown,
-                (peak - equity) / peak * 100,
+def simulate_one_target(
+    bars_by_symbol,
+    flags_by_symbol,
+    starting_capital,
+    target_pct,
+    trade_start=None,
+    trade_end=None,
+):
+    """Event-driven portfolio simulation with cash, 5% positions, and drawdown."""
+
+    slippage = SLIPPAGE_BPS_PER_SIDE / 10000.0
+
+    cash = float(starting_capital)
+    positions = {}
+    trades = []
+    current_prices = {}
+    pending = {}
+
+    max_dd = 0.0
+    peak_equity = float(starting_capital)
+    equity_curve = []
+    skip_count = 0
+
+    timeline = sorted({
+        bar["timestamp"]
+        for rows in bars_by_symbol.values()
+        for bar in rows
+        if trade_end is None or bar["timestamp"] < trade_end
+    })
+
+    at_time = defaultdict(list)
+
+    for symbol, rows in bars_by_symbol.items():
+        for i, bar in enumerate(rows):
+            at_time[bar["timestamp"]].append(
+                (symbol, i, bar)
             )
 
+    for ts in timeline:
+        todays_bars = sorted(
+            at_time[ts],
+            key=lambda item: item[0],
+        )
+
+        # Execute pending signals at the next available bar's open.
+        for symbol, i, bar in todays_bars:
+            if symbol == "SPY":
+                continue
+
+            if symbol in pending and symbol not in positions:
+                local = ts.astimezone(EASTERN)
+
+                if (
+                    local.weekday() < 5
+                    and dt_time(9, 30) <= local.time() < dt_time(16, 0)
+                ):
+                    raw_entry = bar["open"]
+                    entry_fill = raw_entry * (1 + slippage)
+
+                    equity_now = cash + sum(
+                        position["shares"]
+                        * current_prices.get(
+                            held_symbol,
+                            position["entry_fill"],
+                        )
+                        for held_symbol, position in positions.items()
+                    )
+
+                    allocation = min(
+                        equity_now * POSITION_ALLOCATION_PCT,
+                        cash,
+                    )
+
+                    shares = (
+                        allocation / entry_fill
+                        if entry_fill > 0
+                        else 0.0
+                    )
+
+                    if shares > 0 and allocation >= 1.0:
+                        stop = entry_fill * (1 - STOP_LOSS_PCT)
+                        target = entry_fill * (1 + target_pct)
+
+                        cash -= shares * entry_fill
+
+                        positions[symbol] = {
+                            "symbol": symbol,
+                            "entry_time": ts,
+                            "entry_fill": entry_fill,
+                            "shares": shares,
+                            "stop": stop,
+                            "target": target,
+                            "bars_held": 0,
+                            "last_price": raw_entry,
+                        }
+                    else:
+                        skip_count += 1
+
+                pending.pop(symbol, None)
+
+        # If stop and target are both hit within a candle, assume stop first.
+        for symbol, i, bar in todays_bars:
+            current_prices[symbol] = bar["close"]
+
+            position = positions.get(symbol)
+
+            if position:
+                position["bars_held"] += 1
+                position["last_price"] = bar["close"]
+
+                stop = position["stop"]
+                target = position["target"]
+
+                exit_raw = None
+                reason = None
+
+                if bar["open"] <= stop:
+                    exit_raw = bar["open"]
+                    reason = "STOP_GAP"
+
+                elif bar["open"] >= target:
+                    exit_raw = target
+                    reason = "TARGET_GAP"
+
+                else:
+                    hit_stop = bar["low"] <= stop
+                    hit_target = bar["high"] >= target
+
+                    if hit_stop:
+                        exit_raw = stop
+                        reason = (
+                            "STOP_AMBIGUOUS"
+                            if hit_target
+                            else "STOP_1PCT"
+                        )
+
+                    elif hit_target:
+                        exit_raw = target
+                        reason = "TARGET"
+
+                local = ts.astimezone(EASTERN)
+
+                session_end = (
+                    local.weekday() < 5
+                    and local.time() >= dt_time(15, 59)
+                )
+
+                timed_out = (
+                    position["bars_held"] >= MAX_HOLD_MINUTES
+                )
+
+                if exit_raw is None and (session_end or timed_out):
+                    exit_raw = bar["close"]
+                    reason = (
+                        "SESSION_CLOSE"
+                        if session_end
+                        else "TIME_EXIT"
+                    )
+
+                if exit_raw is not None:
+                    exit_fill = max(
+                        0.0001,
+                        exit_raw * (1 - slippage),
+                    )
+
+                    proceeds = position["shares"] * exit_fill
+                    cash += proceeds
+
+                    pnl = (
+                        proceeds
+                        - position["shares"] * position["entry_fill"]
+                    )
+
+                    trades.append({
+                        "symbol": symbol,
+                        "entry_time": position["entry_time"],
+                        "exit_time": ts,
+                        "entry_price": position["entry_fill"],
+                        "exit_price": exit_fill,
+                        "shares": position["shares"],
+                        "pnl": pnl,
+                        "exit_reason": reason,
+                    })
+
+                    del positions[symbol]
+
+        # Schedule signals only after their candles have completed.
+        for symbol, i, bar in todays_bars:
+            flags = flags_by_symbol.get(symbol, [])
+
+            in_window = (
+                (trade_start is None or ts >= trade_start)
+                and (trade_end is None or ts < trade_end)
+            )
+
+            if (
+                in_window
+                and symbol != "SPY"
+                and i < len(flags)
+                and flags[i]
+                and symbol not in positions
+                and symbol not in pending
+            ):
+                pending[symbol] = ts
+
+        # Mark the portfolio to market, including open positions.
+        equity = cash + sum(
+            position["shares"]
+            * current_prices.get(
+                symbol,
+                position["entry_fill"],
+            )
+            for symbol, position in positions.items()
+        )
+
+        peak_equity = max(peak_equity, equity)
+
+        if peak_equity > 0:
+            max_dd = max(
+                max_dd,
+                (peak_equity - equity) / peak_equity * 100.0,
+            )
+
+        equity_curve.append((ts, equity))
+
+    # Close remaining positions at the last available prices.
+    if positions:
+        final_ts = timeline[-1] if timeline else datetime.now(timezone.utc)
+
+        for symbol, position in list(positions.items()):
+            raw_exit = current_prices.get(
+                symbol,
+                position["last_price"],
+            )
+
+            exit_fill = max(
+                0.0001,
+                raw_exit * (1 - slippage),
+            )
+
+            proceeds = position["shares"] * exit_fill
+            cash += proceeds
+
+            pnl = (
+                proceeds
+                - position["shares"] * position["entry_fill"]
+            )
+
+            trades.append({
+                "symbol": symbol,
+                "entry_time": position["entry_time"],
+                "exit_time": final_ts,
+                "entry_price": position["entry_fill"],
+                "exit_price": exit_fill,
+                "shares": position["shares"],
+                "pnl": pnl,
+                "exit_reason": "END_OF_TEST",
+            })
+
+            del positions[symbol]
+
+    ending_equity = cash
+    pnls = [trade["pnl"] for trade in trades]
+
+    gross_profit = sum(pnl for pnl in pnls if pnl > 0)
+    gross_loss = abs(sum(pnl for pnl in pnls if pnl < 0))
+
+    pf = (
+        gross_profit / gross_loss
+        if gross_loss > 0
+        else (float("inf") if gross_profit > 0 else 0.0)
+    )
+
+    wins = sum(pnl > 0 for pnl in pnls)
+    losses = sum(pnl < 0 for pnl in pnls)
+
     return {
-        "starting_capital": float(starting_capital),
+        "starting_capital": starting_capital,
         "ending_equity": ending_equity,
         "net_profit": ending_equity - starting_capital,
         "return_pct": (
             (ending_equity / starting_capital - 1) * 100
-            if starting_capital else 0
+            if starting_capital
+            else 0
         ),
         "trades": len(trades),
         "wins": wins,
         "losses": losses,
-        "win_rate": wins / len(trades) * 100 if trades else 0.0,
-        "profit_factor": profit_factor,
-        "max_drawdown_pct": max_drawdown,
-        "skipped_trades": skipped,
+        "win_rate": (
+            wins / len(trades) * 100
+            if trades
+            else 0.0
+        ),
+        "profit_factor": pf,
+        "max_drawdown_pct": max_dd,
+        "skipped_trades": skip_count,
+        "trade_details": trades,
     }
 
 
-# ============================================================
-# SPY BENCHMARK
-# ============================================================
-
 def calculate_spy_benchmark(spy_rows, start, end, capital):
-    rows = prepare_daily_bars(spy_rows)
-
     eligible = [
-        bar for bar in rows
-        if start <= bar["timestamp"] < end and bar["close"] > 0
+        row
+        for row in spy_rows
+        if start <= parse_ts(row["t"]) < end
+        and number(row.get("c")) > 0
     ]
 
     if len(eligible) < 2:
         return None
 
-    first_close = eligible[0]["close"]
-    last_close = eligible[-1]["close"]
-    ending = capital * last_close / first_close
+    first = number(eligible[0].get("c"))
+
+    if first <= 0:
+        return None
+
+    values = [
+        capital * number(row.get("c")) / first
+        for row in eligible
+    ]
+
+    peak = values[0]
+    drawdown = 0.0
+
+    for value in values:
+        peak = max(peak, value)
+
+        if peak:
+            drawdown = max(
+                drawdown,
+                (peak - value) / peak * 100,
+            )
+
+    ending = values[-1]
+    profit = ending - capital
 
     return {
-        "strategy": "SPY_BUY_HOLD",
         "starting_capital": capital,
         "ending_equity": ending,
-        "net_profit": ending - capital,
-        "return_pct": (ending / capital - 1) * 100,
+        "net_profit": profit,
+        "return_pct": profit / capital * 100,
         "trades": 1,
-        "wins": int(ending > capital),
-        "losses": int(ending < capital),
-        "win_rate": 100.0 if ending > capital else 0.0,
+        "wins": int(profit > 0),
+        "losses": int(profit < 0),
+        "win_rate": 100.0 if profit > 0 else 0.0,
         "profit_factor": 0.0,
-        "max_drawdown_pct": 0.0,
+        "max_drawdown_pct": drawdown,
         "skipped_trades": 0,
     }
 
 
-# ============================================================
-# SUPABASE RESULT SAVING
-# ============================================================
-
-def save_result(result, start_date, end_date, run_id):
+def save_result(run_id, strategy, result, start, end):
     if not SUPABASE_URL or not SUPABASE_KEY:
-        log.error(
-            "Supabase credentials are missing. Result was NOT saved."
+        log.warning(
+            "Supabase credentials missing; result will only appear in workflow logs"
         )
         return False
-
-    strategy = result["strategy"]
-
-    # These rows summarize a strategy, not a specific stock trade.
-    # PORTFOLIO is a documented label in the required text column.
-    symbol = "SPY" if strategy == "SPY_BUY_HOLD" else "PORTFOLIO"
 
     payload = {
         "run_id": run_id,
         "strategy": strategy,
-        "symbol": symbol,
+        "symbol": "PORTFOLIO",
         "starting_capital": result["starting_capital"],
         "ending_equity": result["ending_equity"],
         "net_profit": result["net_profit"],
@@ -889,16 +748,15 @@ def save_result(result, start_date, end_date, run_id):
         "wins": result["wins"],
         "losses": result["losses"],
         "win_rate": result["win_rate"],
-        "profit_factor": (
-            result["profit_factor"]
-            if math.isfinite(result["profit_factor"])
-            else None
-        ),
+        "profit_factor": result["profit_factor"],
         "max_drawdown_pct": result["max_drawdown_pct"],
         "skipped_trades": result["skipped_trades"],
-        "start_date": str(start_date.date()),
-        "end_date": str(end_date.date()),
+        "start_date": str(start.date()),
+        "end_date": str(end.date()),
     }
+
+    if not math.isfinite(payload["profit_factor"]):
+        payload["profit_factor"] = None
 
     try:
         response = SESSION.post(
@@ -917,204 +775,208 @@ def save_result(result, start_date, end_date, run_id):
         return True
 
     except requests.RequestException as exc:
-        response_text = ""
-        if exc.response is not None:
-            response_text = exc.response.text[:500]
-
         log.error(
-            "Supabase save FAILED: strategy=%s, status=%s, error=%s",
+            "Supabase save failed for %s: %s; response=%s",
             strategy,
-            getattr(exc.response, "status_code", "unknown"),
-            response_text or str(exc),
+            exc,
+            getattr(exc.response, "text", "")[:400],
         )
         return False
 
 
-def print_result(result):
+def log_result(strategy, result):
     pf = result["profit_factor"]
 
     pf_text = (
-        "infinity" if not math.isfinite(pf)
+        "infinity"
+        if not math.isfinite(pf)
         else f"{pf:.2f}"
     )
 
     log.info(
-        "RESULT %(strategy)s | capital=$%(starting_capital).2f | "
-        "ending=$%(ending_equity).2f | "
-        "P/L=$%(net_profit).2f (%(return_pct).2f%%) | "
-        "trades=%(trades)d | win rate=%(win_rate).1f%% | "
-        "PF=%(pf)s | max DD=%(max_drawdown_pct).2f%% | "
-        "skipped=%(skipped_trades)d",
-        {**result, "pf": pf_text},
+        "RESULT %s | start=$%.2f end=$%.2f P/L=$%.2f (%.2f%%) "
+        "trades=%s win=%.1f%% PF=%s maxDD=%.2f%% skipped=%s",
+        strategy,
+        result["starting_capital"],
+        result["ending_equity"],
+        result["net_profit"],
+        result["return_pct"],
+        result["trades"],
+        result["win_rate"],
+        pf_text,
+        result["max_drawdown_pct"],
+        result["skipped_trades"],
     )
 
-
-# ============================================================
-# MAIN
-# ============================================================
 
 def main():
-    # One ID groups every result from this backtest run.
+    end = datetime.now(timezone.utc).replace(
+        second=0,
+        microsecond=0,
+    )
+
+    start = end - timedelta(days=BACKTEST_DAYS)
+
+    log.info(
+        "ONE-MINUTE MOMENTUM BACKTEST | %s to %s | targets=%s | "
+        "stop=1%% | position=5%% | paper/research only",
+        start.date(),
+        end.date(),
+        [f"{target * 100:.2f}%" for target in PROFIT_TARGETS],
+    )
+
+    symbols = discover_and_screen(start, end)
+
+    all_bars = {}
+    stock_symbols = [
+        symbol for symbol in symbols
+        if symbol != "SPY"
+    ]
+
+    for batch_no, batch in enumerate(
+        chunks(stock_symbols, 10),
+        1,
+    ):
+        all_bars.update(
+            download_bars(batch, "1Min", start, end)
+        )
+
+        log.info(
+            "Downloaded minute-bar batch %s/%s",
+            batch_no,
+            math.ceil(len(stock_symbols) / 10),
+        )
+
+    spy_daily = download_bars(
+        ["SPY"],
+        "1Day",
+        start - timedelta(days=5),
+        end,
+    ).get("SPY", [])
+
+    bars_by_symbol = {}
+    flags_by_symbol = {}
+
+    for symbol, rows in all_bars.items():
+        parsed, flags = build_signal_flags(rows)
+
+        keep = [
+            (i, bar)
+            for i, bar in enumerate(parsed)
+            if regular_session(rows[i])
+        ]
+
+        if len(keep) < 100:
+            continue
+
+        bars_by_symbol[symbol] = [
+            bar for _, bar in keep
+        ]
+
+        flags_by_symbol[symbol] = [
+            flags[i] for i, _ in keep
+        ]
+
+    log.info(
+        "Ready to simulate %s symbols with usable minute bars",
+        len(bars_by_symbol),
+    )
+
+    if not bars_by_symbol:
+        raise RuntimeError(
+            "No usable minute bars downloaded. Check Alpaca data "
+            "permissions/feed and date range."
+        )
+
     run_id = str(uuid.uuid4())
-
-    log.info("Starting backtest run_id=%s", run_id)
-
-    now = datetime.now(timezone.utc).replace(
-        hour=0, minute=0, second=0, microsecond=0
-    )
-
-    test_start = now - timedelta(days=BACKTEST_DAYS)
-    data_start = test_start - timedelta(days=DAILY_WARMUP_DAYS)
-    data_end = now
+    split = start + (end - start) * 0.70
 
     log.info(
-        "Backtest period: %s through %s UTC.",
-        test_start.date(),
-        data_end.date(),
+        "Chronological split: in-sample %s through %s; "
+        "out-of-sample %s through %s",
+        start.date(),
+        split.date(),
+        split.date(),
+        end.date(),
     )
 
-    all_symbols = discover_symbols()
-    symbols = screen_universe(all_symbols, data_start, data_end)
-
-    if not symbols:
-        raise RuntimeError("No stocks passed the liquidity screen.")
-
-    log.info(
-        "Downloading daily bars for %s selected stocks plus SPY.",
-        len(symbols),
-    )
-
-    daily_data = {}
-    symbols_with_spy = list(dict.fromkeys(symbols + ["SPY"]))
-
-    for batch_number, batch in enumerate(
-        chunks(symbols_with_spy, DAILY_BATCH_SIZE), start=1
-    ):
-        daily_data.update(
-            download_bars(batch, "1Day", data_start, data_end)
-        )
-        log.info("Daily data batch %s downloaded.", batch_number)
-
-    spy_rows = daily_data.get("SPY", [])
-
-    if len(spy_rows) < 60:
-        raise RuntimeError(
-            f"Not enough SPY daily bars for indicators: {len(spy_rows)}"
+    for target in PROFIT_TARGETS:
+        base = (
+            f"M1_MOM_T{target * 100:.2f}_SL1.00_ALLOC5"
         )
 
-    log.info("Downloading minute bars for ORB strategies.")
-
-    minute_data = {}
-
-    for batch_number, batch in enumerate(
-        chunks(symbols, SYMBOL_BATCH_SIZE), start=1
-    ):
-        minute_data.update(
-            download_bars(batch, "1Min", test_start, data_end)
-        )
-        log.info(
-            "Minute data batch %s/%s downloaded.",
-            batch_number,
-            math.ceil(len(symbols) / SYMBOL_BATCH_SIZE),
-        )
-
-    candidates_by_strategy = {}
-
-    for opening_minutes in ORB_STRATEGIES:
-        name = f"ORB_{opening_minutes}M"
-        candidates_by_strategy[name] = []
-
-        for symbol in symbols:
-            candidates_by_strategy[name].extend(
-                generate_orb_candidates(
-                    symbol,
-                    minute_data.get(symbol, []),
-                    opening_minutes,
+        for phase, phase_start, phase_end in (
+            ("IS", start, split),
+            ("OOS", split, end),
+        ):
+            for capital in STARTING_CAPITALS:
+                result = simulate_one_target(
+                    bars_by_symbol,
+                    flags_by_symbol,
+                    capital,
+                    target,
+                    trade_start=phase_start,
+                    trade_end=phase_end,
                 )
-            )
 
-        log.info(
-            "%s generated %s candidate trades.",
-            name,
-            len(candidates_by_strategy[name]),
-        )
+                strategy = f"{phase}_{base}"
 
-    for name, lookback, volume_multiplier, atr_multiplier in MOMENTUM_CONFIGS:
-        candidates_by_strategy[name] = []
-
-        for symbol in symbols:
-            candidates_by_strategy[name].extend(
-                generate_momentum_candidates(
-                    symbol,
-                    daily_data.get(symbol, []),
-                    spy_rows,
-                    lookback,
-                    volume_multiplier,
-                    atr_multiplier,
-                    test_start,
-                    data_end,
+                log_result(
+                    strategy + f"_C{capital}",
+                    result,
                 )
-            )
 
-        log.info(
-            "%s generated %s candidate trades.",
-            name,
-            len(candidates_by_strategy[name]),
-        )
+                if not save_result(
+                    run_id,
+                    strategy,
+                    result,
+                    phase_start,
+                    phase_end,
+                ):
+                    log.warning(
+                        "Could not save %s capital $%s result",
+                        strategy,
+                        capital,
+                    )
 
-    results = []
-    save_successes = 0
-    save_failures = 0
-
-    for strategy_name, candidates in candidates_by_strategy.items():
+    for phase, phase_start, phase_end in (
+        ("IS", start, split),
+        ("OOS", split, end),
+    ):
         for capital in STARTING_CAPITALS:
-            result = simulate_strategy(candidates, capital)
-            result["strategy"] = strategy_name
+            benchmark = calculate_spy_benchmark(
+                spy_daily,
+                phase_start,
+                phase_end,
+                capital,
+            )
 
-            print_result(result)
+            if benchmark:
+                strategy = f"{phase}_SPY_BUY_HOLD"
 
-            if save_result(result, test_start, data_end, run_id):
-                save_successes += 1
-            else:
-                save_failures += 1
+                log_result(
+                    strategy + f"_C{capital}",
+                    benchmark,
+                )
 
-            results.append(result)
+                save_result(
+                    run_id,
+                    strategy,
+                    benchmark,
+                    phase_start,
+                    phase_end,
+                )
 
-    for capital in STARTING_CAPITALS:
-        benchmark = calculate_spy_benchmark(
-            spy_rows, test_start, data_end, capital
-        )
-
-        if benchmark:
-            print_result(benchmark)
-
-            if save_result(benchmark, test_start, data_end, run_id):
-                save_successes += 1
-            else:
-                save_failures += 1
-
-            results.append(benchmark)
-
-    log.info("================ SAVE SUMMARY ================")
-    log.info("Backtest run ID: %s", run_id)
-    log.info("Results generated: %s", len(results))
-    log.info("Supabase saves succeeded: %s", save_successes)
-    log.info("Supabase saves failed: %s", save_failures)
-
-    if save_failures:
-        log.error(
-            "Some results were not saved. Review the Supabase errors above."
-        )
-
-    if save_successes == 0:
-        raise RuntimeError(
-            "No backtest results were saved to Supabase. "
-            "Check credentials, table constraints, and database policies."
-        )
+    log.info(
+        "Completed. Results include separate chronological "
+        "in-sample/out-of-sample tests, slippage, 5%% position "
+        "allocation, 1%% stop, and mark-to-market drawdown."
+    )
 
     log.warning(
-        "Historical simulation is not a prediction of future results. "
-        "Survivorship bias and execution assumptions may affect results."
+        "Limits: current active universe creates survivorship bias; "
+        "IEX data may be incomplete; a short pilot is not evidence "
+        "of profitability. No orders were placed."
     )
 
 
