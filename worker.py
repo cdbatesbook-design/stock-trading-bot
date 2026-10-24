@@ -1,110 +1,119 @@
-"""
-Stock Trading Bot - Repair and Testing Version
-
-Alpaca paper account only.
-Automatic order execution is disabled.
-"""
-
-import logging
-import math
 import os
 import time
+import logging
 from datetime import datetime, timezone
 
 import pandas as pd
 import yfinance as yf
+
 from supabase import create_client
 from alpaca.trading.client import TradingClient
+from alpaca.trading.requests import GetAssetsRequest
+from alpaca.trading.enums import AssetClass, AssetStatus
 
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
 
-PAPER_MODE = True
-ORDER_EXECUTION_ENABLED = False
-
 SCAN_INTERVAL_SECONDS = 300
-RSI_PERIOD = 14
+ASSET_REFRESH_SECONDS = 86400
+BATCH_SIZE = 50
 
-WATCHLIST = [
-    "EDAC", "AAPL", "MSFT", "NVDA", "AMZN",
-    "GOOGL", "META", "TSLA", "AMD", "AVGO",
-    "NFLX", "JPM", "BAC", "WMT", "COST",
-    "DIS", "KO", "PEP", "XOM", "F", "INTC",
-]
+# Safety: this worker NEVER submits orders.
+AUTOMATIC_ORDER_EXECUTION = False
 
+# Alpaca paper trading is required.
+PAPER_TRADING = True
+
+MIN_PRICE = 2.00
+MIN_AVERAGE_VOLUME = 100000
 
 # ============================================================
-# RENDER LOGGING
+# LOGGING
 # ============================================================
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
-    force=True,
 )
 
-log = logging.getLogger("stock_trading_bot")
-
-
-def utc_now():
-    return datetime.now(timezone.utc).isoformat()
-
-
-def required_env(name):
-    value = os.getenv(name, "").strip()
-
-    if not value:
-        raise RuntimeError(
-            f"Missing Render environment variable: {name}"
-        )
-
-    return value
+logger = logging.getLogger("stock_bot")
 
 
 # ============================================================
-# CONNECTIONS
+# ENVIRONMENT VARIABLES
+# ============================================================
+
+ALPACA_API_KEY = os.environ.get("ALPACA_API_KEY")
+ALPACA_SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY")
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_SERVICE_ROLE_KEY = os.environ.get(
+    "SUPABASE_SERVICE_ROLE_KEY"
+)
+
+required_variables = {
+    "ALPACA_API_KEY": ALPACA_API_KEY,
+    "ALPACA_SECRET_KEY": ALPACA_SECRET_KEY,
+    "SUPABASE_URL": SUPABASE_URL,
+    "SUPABASE_SERVICE_ROLE_KEY": SUPABASE_SERVICE_ROLE_KEY,
+}
+
+missing_variables = [
+    name
+    for name, value in required_variables.items()
+    if not value
+]
+
+if missing_variables:
+    raise RuntimeError(
+        "Missing environment variables: "
+        + ", ".join(missing_variables)
+    )
+
+
+# ============================================================
+# CLIENTS
 # ============================================================
 
 supabase = create_client(
-    required_env("SUPABASE_URL"),
-    required_env("SUPABASE_SERVICE_ROLE_KEY"),
+    SUPABASE_URL,
+    SUPABASE_SERVICE_ROLE_KEY,
 )
 
-# Always connect to Alpaca PAPER trading.
-trading = TradingClient(
-    required_env("ALPACA_API_KEY"),
-    required_env("ALPACA_SECRET_KEY"),
+alpaca = TradingClient(
+    ALPACA_API_KEY,
+    ALPACA_SECRET_KEY,
     paper=True,
 )
 
 
 # ============================================================
-# LOGGING TO SUPABASE AND RENDER
+# DATABASE LOGGING
 # ============================================================
 
-def save_log(level, message):
-    level = str(level).upper()
-    message = str(message)[:1000]
+def log_event(message, level="INFO"):
+    """Write messages to Render logs and Supabase."""
 
-    # Render captures these console messages.
-    log.log(
-        getattr(logging, level, logging.INFO),
-        message,
-    )
+    log_level = level.upper()
 
-    # Save the same event in Supabase.
+    if log_level == "ERROR":
+        logger.error(message)
+    elif log_level == "WARNING":
+        logger.warning(message)
+    else:
+        logger.info(message)
+
     try:
         supabase.table("bot_logs").insert({
-            "level": level,
-            "message": message,
-            "created_at": utc_now(),
+            "level": log_level,
+            "message": str(message)[:1000],
         }).execute()
 
-    except Exception:
-        log.exception(
-            "Failed to save message to Supabase bot_logs"
+    except Exception as exc:
+        logger.error(
+            "Could not write to Supabase bot_logs: %s",
+            exc,
         )
 
 
@@ -113,73 +122,155 @@ def save_log(level, message):
 # ============================================================
 
 def get_bot_config():
-    response = (
-        supabase.table("bot_status")
-        .select("*")
-        .eq("id", 1)
-        .limit(1)
-        .execute()
-    )
+    """Read bot configuration from Supabase."""
 
-    rows = response.data or []
-
-    if not rows:
-        raise RuntimeError(
-            "Supabase bot_status row id=1 was not found"
-        )
-
-    return rows[0]
-
-
-def update_bot_status(message, error=None):
-    # Read the existing row to avoid guessing which optional
-    # columns exist in the database.
-    current = get_bot_config()
-    existing_columns = set(current.keys())
-
-    updates = {}
-
-    if "mode" in existing_columns:
-        updates["mode"] = "paper"
-
-    if "status_message" in existing_columns:
-        updates["status_message"] = str(message)[:1000]
-
-    if "last_heartbeat" in existing_columns:
-        updates["last_heartbeat"] = utc_now()
-
-    if "updated_at" in existing_columns:
-        updates["updated_at"] = utc_now()
-
-    if "last_scan" in existing_columns:
-        updates["last_scan"] = utc_now()
-
-    if error is not None and "last_error" in existing_columns:
-        updates["last_error"] = str(error)[:1000]
-
-    if updates:
-        (
+    try:
+        response = (
             supabase.table("bot_status")
-            .update(updates)
+            .select("*")
             .eq("id", 1)
+            .limit(1)
             .execute()
         )
 
-    save_log(
-        "INFO",
-        f"Bot status updated: {message}",
+        if response.data:
+            return response.data[0]
+
+        log_event(
+            "No bot_status row found with id=1.",
+            "WARNING",
+        )
+
+    except Exception as exc:
+        log_event(
+            f"Unable to read bot_status: {exc}",
+            "ERROR",
+        )
+
+    return {}
+
+
+def update_bot_status(message, error=None):
+    """Update supported status columns without assuming the schema."""
+
+    try:
+        response = (
+            supabase.table("bot_status")
+            .select("*")
+            .eq("id", 1)
+            .limit(1)
+            .execute()
+        )
+
+        if not response.data:
+            log_event(
+                "Cannot update status: bot_status id=1 is missing.",
+                "WARNING",
+            )
+            return
+
+        existing_row = response.data[0]
+        now = datetime.now(timezone.utc).isoformat()
+
+        possible_values = {
+            "status_message": message,
+            "last_heartbeat": now,
+            "updated_at": now,
+            "last_scan": now,
+        }
+
+        if error:
+            possible_values["last_error"] = str(error)[:1000]
+
+        else:
+            possible_values["last_error"] = None
+
+        updates = {
+            key: value
+            for key, value in possible_values.items()
+            if key in existing_row
+        }
+
+        if updates:
+            (
+                supabase.table("bot_status")
+                .update(updates)
+                .eq("id", 1)
+                .execute()
+            )
+
+    except Exception as exc:
+        logger.error(
+            "Unable to update bot status: %s",
+            exc,
+        )
+
+
+# ============================================================
+# DISCOVER ALL ELIGIBLE STOCKS
+# ============================================================
+
+def get_all_eligible_stocks():
+    """
+    Retrieve active, tradable U.S. equity assets from Alpaca.
+
+    This removes the old fixed 21-symbol watchlist.
+    Actual coverage depends on Alpaca's available assets
+    and the market-data subscription.
+    """
+
+    log_event("Refreshing eligible stock universe.")
+
+    request = GetAssetsRequest(
+        status=AssetStatus.ACTIVE,
+        asset_class=AssetClass.US_EQUITY,
     )
 
+    assets = alpaca.get_all_assets(request)
+
+    symbols = []
+
+    for asset in assets:
+        try:
+            if not asset.tradable:
+                continue
+
+            symbol = asset.symbol
+
+            if not symbol:
+                continue
+
+            # Skip symbols that are unsuitable for ordinary
+            # ticker-based scanning, such as dotted share classes.
+            if not symbol.isalnum():
+                continue
+
+            symbols.append(symbol)
+
+        except Exception:
+            continue
+
+    symbols = sorted(set(symbols))
+
+    log_event(
+        f"Eligible stock universe refreshed: "
+        f"{len(symbols)} symbols."
+    )
+
+    return symbols
+
 
 # ============================================================
-# RSI INDICATOR
+# TECHNICAL INDICATORS
 # ============================================================
 
-def calculate_rsi(close, period=RSI_PERIOD):
-    changes = close.diff()
+def calculate_rsi(series, period=14):
+    """Calculate the Relative Strength Index."""
 
-    gains = changes.clip(lower=0)
-    losses = -changes.clip(upper=0)
+    delta = series.diff()
+
+    gains = delta.clip(lower=0)
+    losses = -delta.clip(upper=0)
 
     average_gain = gains.ewm(
         alpha=1 / period,
@@ -193,146 +284,210 @@ def calculate_rsi(close, period=RSI_PERIOD):
         adjust=False,
     ).mean()
 
-    safe_loss = average_loss.replace(
-        0,
-        float("nan"),
+    relative_strength = (
+        average_gain / average_loss.replace(0, float("nan"))
     )
 
-    relative_strength = average_gain / safe_loss
-
-    rsi = 100 - (
-        100 / (1 + relative_strength)
-    )
-
-    rsi = rsi.mask(
-        (average_loss == 0) & (average_gain > 0),
-        100.0,
-    )
-
-    rsi = rsi.mask(
-        (average_loss == 0) & (average_gain == 0),
-        50.0,
-    )
+    rsi = 100 - (100 / (1 + relative_strength))
 
     return rsi
 
 
 # ============================================================
-# STOCK SIGNALS
+# STOCK ANALYSIS
 # ============================================================
 
-def get_signal(symbol):
+def analyze_stock(symbol):
+    """
+    Analyze a single symbol using recent daily price history.
+
+    Produces signals only. Does not place orders.
+    """
+
     try:
         data = yf.download(
             symbol,
             period="6mo",
             interval="1d",
-            auto_adjust=True,
             progress=False,
+            auto_adjust=True,
             threads=False,
+            timeout=20,
         )
 
         if data is None or data.empty:
-            return "HOLD", "No market data available"
+            return {
+                "symbol": symbol,
+                "signal": "NO_DATA",
+            }
 
+        # yfinance can return MultiIndex columns.
         if isinstance(data.columns, pd.MultiIndex):
             data.columns = data.columns.get_level_values(0)
 
-        if "Close" not in data.columns:
-            return "HOLD", "Closing price data unavailable"
+        required_columns = {"Close", "Volume"}
 
-        close = pd.to_numeric(
-            data["Close"],
-            errors="coerce",
-        ).dropna()
+        if not required_columns.issubset(set(data.columns)):
+            return {
+                "symbol": symbol,
+                "signal": "INVALID_DATA",
+            }
 
-        if len(close) < 60:
-            return "HOLD", "Insufficient price history"
+        close = data["Close"].dropna()
+        volume = data["Volume"].dropna()
 
-        sma20 = close.rolling(20).mean()
-        sma50 = close.rolling(50).mean()
-        rsi = calculate_rsi(close)
+        if len(close) < 50 or len(volume) < 20:
+            return {
+                "symbol": symbol,
+                "signal": "INSUFFICIENT_HISTORY",
+            }
 
-        price = float(close.iloc[-1])
-        average20 = float(sma20.iloc[-1])
-        average50 = float(sma50.iloc[-1])
-        rsi_value = float(rsi.iloc[-1])
+        last_price = float(close.iloc[-1])
+        average_volume = float(volume.tail(20).mean())
 
-        values = [
-            price,
-            average20,
-            average50,
-            rsi_value,
-        ]
+        sma20 = float(close.tail(20).mean())
+        sma50 = float(close.tail(50).mean())
 
-        if not all(math.isfinite(v) for v in values):
-            return "HOLD", "Invalid indicator values"
+        rsi_series = calculate_rsi(close)
+        rsi_value = float(rsi_series.iloc[-1])
 
-        details = (
-            f"Price={price:.2f}; "
-            f"SMA20={average20:.2f}; "
-            f"SMA50={average50:.2f}; "
-            f"RSI={rsi_value:.2f}"
-        )
-
-        if (
-            price > average20
-            and average20 > average50
-            and 45 <= rsi_value <= 68
+        if not all(
+            pd.notna(value)
+            for value in [
+                last_price,
+                average_volume,
+                sma20,
+                sma50,
+                rsi_value,
+            ]
         ):
-            return "BUY_SIGNAL", details
+            return {
+                "symbol": symbol,
+                "signal": "INVALID_INDICATORS",
+            }
 
-        return "HOLD", details
+        if last_price < MIN_PRICE:
+            signal = "FILTERED_LOW_PRICE"
+
+        elif average_volume < MIN_AVERAGE_VOLUME:
+            signal = "FILTERED_LOW_VOLUME"
+
+        elif last_price > sma20 > sma50 and 40 <= rsi_value <= 65:
+            signal = "BUY_SIGNAL"
+
+        elif last_price < sma20 and sma20 < sma50:
+            signal = "SELL_SIGNAL"
+
+        else:
+            signal = "HOLD"
+
+        return {
+            "symbol": symbol,
+            "signal": signal,
+            "price": round(last_price, 4),
+            "sma20": round(sma20, 4),
+            "sma50": round(sma50, 4),
+            "rsi": round(rsi_value, 2),
+            "average_volume": int(average_volume),
+        }
 
     except Exception as exc:
-        save_log(
-            "ERROR",
-            f"{symbol} signal calculation failed: "
-            f"{str(exc)[:500]}",
-        )
-
-        return "HOLD", "Market-data calculation failed"
+        return {
+            "symbol": symbol,
+            "signal": "ERROR",
+            "error": str(exc)[:500],
+        }
 
 
 # ============================================================
-# ALPACA PAPER ACCOUNT
+# RECORD SCAN RESULTS
 # ============================================================
 
-def check_paper_account():
-    account = trading.get_account()
-    equity = float(account.equity)
+def record_result(result):
+    """Record scan outcomes in the bot logs."""
 
-    if not math.isfinite(equity) or equity <= 0:
-        raise RuntimeError(
-            "Alpaca returned invalid account equity"
+    symbol = result.get("symbol", "UNKNOWN")
+    signal = result.get("signal", "UNKNOWN")
+
+    if signal == "ERROR":
+        log_event(
+            f"Analysis failed for {symbol}: "
+            f"{result.get('error', 'Unknown error')}",
+            "WARNING",
+        )
+        return
+
+    if signal in ("BUY_SIGNAL", "SELL_SIGNAL"):
+        log_event(
+            f"{signal} {symbol} | "
+            f"Price={result.get('price')} | "
+            f"SMA20={result.get('sma20')} | "
+            f"SMA50={result.get('sma50')} | "
+            f"RSI={result.get('rsi')}"
         )
 
-    save_log(
-        "INFO",
-        f"Alpaca paper account connected; "
-        f"equity=${equity:.2f}",
+
+# ============================================================
+# MARKET SCANNER
+# ============================================================
+
+def run_market_scan(symbols):
+    """
+    Scan the discovered universe in batches.
+
+    This is a broad-market scanner, not a guarantee that every
+    symbol can be analyzed on every cycle. Data providers can
+    throttle requests or fail to return some symbols.
+    """
+
+    total = len(symbols)
+
+    if total == 0:
+        log_event(
+            "No eligible stocks available to scan.",
+            "WARNING",
+        )
+        return
+
+    log_event(
+        f"Starting market scan for {total} eligible symbols."
     )
 
+    scanned = 0
+    signals = 0
+    errors = 0
 
-# ============================================================
-# WATCHLIST SCAN
-# ============================================================
+    for start in range(0, total, BATCH_SIZE):
+        batch = symbols[start:start + BATCH_SIZE]
 
-def scan_watchlist():
-    update_bot_status(
-        "Scanning watchlist; paper mode; orders disabled"
-    )
+        for symbol in batch:
+            result = analyze_stock(symbol)
+            scanned += 1
 
-    for symbol in WATCHLIST:
-        signal, details = get_signal(symbol)
+            if result.get("signal") in (
+                "BUY_SIGNAL",
+                "SELL_SIGNAL",
+            ):
+                signals += 1
 
-        save_log(
-            "INFO",
-            f"{symbol}: {signal} | {details}",
+            if result.get("signal") == "ERROR":
+                errors += 1
+
+            record_result(result)
+
+            # Pace requests to reduce the risk of throttling.
+            time.sleep(0.25)
+
+        log_event(
+            f"Scan progress: {scanned}/{total} symbols; "
+            f"signals={signals}; errors={errors}."
         )
 
-    update_bot_status(
-        "Watchlist scan completed; orders disabled"
+    log_event(
+        f"Market scan complete. "
+        f"Scanned={scanned}; "
+        f"signals={signals}; "
+        f"errors={errors}."
     )
 
 
@@ -341,52 +496,99 @@ def scan_watchlist():
 # ============================================================
 
 def main():
-    save_log(
-        "INFO",
-        "Worker started; Alpaca paper mode; "
-        "automatic order execution disabled",
+    log_event(
+        "Stock scanner starting. "
+        "Alpaca paper mode enabled. "
+        "Automatic order execution disabled."
     )
+
+    update_bot_status(
+        "Starting broad-market stock scanner."
+    )
+
+    symbols = []
+    last_asset_refresh = 0
 
     while True:
         try:
             config = get_bot_config()
 
-            if config.get("enabled") is not True:
+            enabled = config.get("enabled") is True
+            mode = str(config.get("mode", "paper")).lower()
+
+            if not enabled:
                 update_bot_status(
-                    "Paused: bot_status.enabled is not true"
+                    "Paused: bot_status.enabled is not true."
                 )
 
-            elif str(config.get("mode", "paper")).lower() != "paper":
+                time.sleep(30)
+                continue
+
+            if mode != "paper":
                 update_bot_status(
-                    "Paused: database mode must be paper"
+                    "Stopped: only paper mode is allowed."
                 )
 
-            else:
-                check_paper_account()
-                scan_watchlist()
+                log_event(
+                    "Safety stop: bot mode is not paper.",
+                    "ERROR",
+                )
 
-        except Exception as exc:
-            message = str(exc)[:800]
+                time.sleep(60)
+                continue
 
-            log.exception("Worker cycle failed")
+            now = time.time()
 
-            save_log(
-                "ERROR",
-                f"Worker cycle failed: {message}",
+            if (
+                not symbols
+                or now - last_asset_refresh >= ASSET_REFRESH_SECONDS
+            ):
+                symbols = get_all_eligible_stocks()
+                last_asset_refresh = time.time()
+
+            if not symbols:
+                update_bot_status(
+                    "No eligible stocks found."
+                )
+
+                time.sleep(60)
+                continue
+
+            account = alpaca.get_account()
+
+            log_event(
+                f"Paper account connected. "
+                f"Equity={account.equity}; "
+                f"Buying power={account.buying_power}."
             )
 
-            try:
-                update_bot_status(
-                    f"Worker error: {message}",
-                    error=message,
-                )
+            update_bot_status(
+                f"Scanning {len(symbols)} eligible stocks. "
+                "Paper mode; orders disabled."
+            )
 
-            except Exception:
-                log.exception(
-                    "Could not update bot_status after failure"
-                )
+            run_market_scan(symbols)
 
-        time.sleep(SCAN_INTERVAL_SECONDS)
+            update_bot_status(
+                f"Last scan completed. "
+                f"Universe size={len(symbols)}. "
+                "Orders disabled."
+            )
+
+            time.sleep(SCAN_INTERVAL_SECONDS)
+
+        except Exception as exc:
+            log_event(
+                f"Worker cycle failed: {exc}",
+                "ERROR",
+            )
+
+            update_bot_status(
+                "Worker encountered an error.",
+                error=str(exc),
+            )
+
+            time.sleep(60)
 
 
 if __name__ == "__main__":
