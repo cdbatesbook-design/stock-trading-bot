@@ -9,666 +9,1957 @@ from itertools import product
 import requests
 import pandas as pd
 
+
 # ============================================================
-# STOCK TRADING BOT V2 — AUTOMATED STRATEGY RESEARCH
-# Research/backtesting only. Does NOT place trades.
+# CONFIGURATION
 # ============================================================
 
 DATA_URL = "https://data.alpaca.markets/v2"
-TRADING_URL = "https://paper-api.alpaca.markets"
 
-BACKTEST_DAYS = int(os.getenv("BACKTEST_DAYS", "90"))
-SCREEN_LOOKBACK_DAYS = int(os.getenv("SCREEN_LOOKBACK_DAYS", "45"))
-MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "50"))
-
-MAX_POSITIONS = 3
-POSITION_ALLOCATION = 0.05
-STARTING_CAPITALS = [500, 1000, 2500, 5000]
-
-MIN_STOCK_PRICE = 5.0
-MIN_AVG_DOLLAR_VOLUME = 20_000_000
-DATA_FEED = os.getenv("DATA_FEED", "iex")
-
-ALLOW_FRACTIONAL_SHARES = (
-    os.getenv("ALLOW_FRACTIONAL_SHARES", "true").lower() == "true"
+API_KEY = (
+    os.getenv("ALPACA_API_KEY")
+    or os.getenv("ALPACA_API_KEY_ID")
+    or os.getenv("APCA_API_KEY_ID")
 )
 
-SLIPPAGE_BPS_PER_SIDE = 5
-COMMISSION_PER_SHARE = 0.0
+API_SECRET = (
+    os.getenv("ALPACA_SECRET_KEY")
+    or os.getenv("ALPACA_API_SECRET_KEY")
+    or os.getenv("APCA_API_SECRET_KEY")
+)
 
-STOP_LOSSES = [0.005, 0.0075, 0.01]
-TARGET_RETURNS = [0.005, 0.0075, 0.01, 0.015]
-EMA_PAIRS = [(5, 13), (9, 21), (12, 26)]
-BREAKOUT_LOOKBACKS = [10, 20]
-VOLUME_MULTIPLIERS = [1.2, 1.5]
-MAX_HOLD_MINUTES_OPTIONS = [30, 60, 120]
-
-TOP_CANDIDATES_TO_VALIDATE = 8
-MIN_TRAIN_TRADES = 30
+DATA_FEED = os.getenv("ALPACA_DATA_FEED", "iex")
 
 ET = ZoneInfo("America/New_York")
-UTC = ZoneInfo("UTC")
 
-OUT_DIR = os.getenv("BACKTEST_OUTPUT_DIR", ".")
-os.makedirs(OUT_DIR, exist_ok=True)
+BACKTEST_DAYS = int(os.getenv("BACKTEST_DAYS", "180"))
+
+MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "12"))
+
+# Your required limit.
+MAX_POSITIONS = 3
+
+# Initial target allocation per position.
+POSITION_ALLOCATION = 0.05
+
+MIN_STOCK_PRICE = 5.00
+
+# Conservative estimated slippage on each side of a trade.
+SLIPPAGE_BPS = 5.0
+
+# Commission per share on each side.
+COMMISSION_PER_SHARE = 0.0
+
+ALLOW_FRACTIONAL = (
+    os.getenv("ALLOW_FRACTIONAL", "true").lower()
+    in ("1", "true", "yes")
+)
+
+STARTING_CAPITALS = [500, 1000, 2500, 5000]
+
+# Data split proportions:
+# 60% training, 20% validation, 20% final test.
+TRAIN_FRACTION = 0.60
+VALIDATION_FRACTION = 0.20
+
+# A candidate needs sufficient training and validation trades.
+MIN_TRAIN_TRADES = 30
+MIN_VALIDATION_TRADES = 10
+
+# Validation acceptance requirements.
+MIN_VALIDATION_RETURN = 0.0
+MIN_VALIDATION_PROFIT_FACTOR = 1.0
+MAX_VALIDATION_DRAWDOWN = 0.10
+
+# Only the best training candidates are checked on validation.
+TOP_TRAIN_CANDIDATES = 15
+
+OUTPUT_DIR = os.getenv("OUTPUT_DIR", ".")
+
+DEFAULT_SYMBOLS = (
+    "SPY,QQQ,IWM,AAPL,MSFT,NVDA,AMZN,META,"
+    "GOOGL,TSLA,AMD,PLTR"
+)
+
+SYMBOLS = [
+    symbol.strip().upper()
+    for symbol in os.getenv(
+        "SYMBOLS",
+        DEFAULT_SYMBOLS
+    ).split(",")
+    if symbol.strip()
+][:MAX_SYMBOLS]
+
+
+# ============================================================
+# SMALLER STRATEGY SEARCH
+# ============================================================
+
+FAST_EMAS = [5, 9]
+SLOW_EMAS = [13, 21]
+
+BREAKOUT_PERIODS = [10]
+
+VOLUME_MULTIPLIERS = [1.2, 1.5]
+
+STOP_PCTS = [0.0075, 0.01]
+
+TARGET_PCTS = [0.01, 0.015]
+
+MAX_HOLD_BARS = [30, 60]
+
+
+# ============================================================
+# LOGGING
+# ============================================================
 
 logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO"),
+    level=logging.INFO,
     format="%(asctime)s %(levelname)s: %(message)s",
 )
-log = logging.getLogger("backtest_v2")
 
-SESSION_OPEN = dt_time(9, 30)
-SESSION_CLOSE = dt_time(16, 0)
+log = logging.getLogger("trading_research")
 
 
 # ============================================================
-# API ACCESS
+# VALIDATION
 # ============================================================
 
-def get_credentials():
-    key = os.getenv("APCA_API_KEY_ID") or os.getenv("ALPACA_API_KEY")
-    secret = (
-        os.getenv("APCA_API_SECRET_KEY")
-        or os.getenv("ALPACA_API_SECRET_KEY")
-        or os.getenv("ALPACA_SECRET_KEY")
-    )
+def validate_configuration():
 
-    if not key or not secret:
+    if not API_KEY or not API_SECRET:
         raise RuntimeError(
-            "Missing Alpaca credentials. Configure APCA_API_KEY_ID "
-            "and APCA_API_SECRET_KEY in GitHub repository secrets."
+            "Missing Alpaca credentials. Configure "
+            "ALPACA_API_KEY and ALPACA_SECRET_KEY "
+            "in GitHub Secrets."
         )
 
-    return key, secret
+    if not SYMBOLS:
+        raise RuntimeError(
+            "No symbols configured."
+        )
 
+    if MAX_POSITIONS != 3:
+        raise RuntimeError(
+            "MAX_POSITIONS must equal 3."
+        )
 
-API_KEY, API_SECRET = get_credentials()
-SESSION = requests.Session()
-SESSION.headers.update({
-    "APCA-API-KEY-ID": API_KEY,
-    "APCA-API-SECRET-KEY": API_SECRET,
-})
+    if POSITION_ALLOCATION <= 0:
+        raise RuntimeError(
+            "POSITION_ALLOCATION must be positive."
+        )
 
+    if POSITION_ALLOCATION > 1:
+        raise RuntimeError(
+            "POSITION_ALLOCATION cannot exceed 1."
+        )
 
-def api_get(url, params=None, attempts=5):
-    last_error = None
+    if BACKTEST_DAYS < 60:
+        raise RuntimeError(
+            "BACKTEST_DAYS must be at least 60 "
+            "for this three-way research split."
+        )
 
-    for attempt in range(attempts):
-        try:
-            response = SESSION.get(url, params=params, timeout=45)
+    if SLIPPAGE_BPS < 0:
+        raise RuntimeError(
+            "SLIPPAGE_BPS cannot be negative."
+        )
 
-            if response.status_code == 429 or response.status_code >= 500:
-                time.sleep(min(2 ** attempt, 20))
-                continue
+    if COMMISSION_PER_SHARE < 0:
+        raise RuntimeError(
+            "COMMISSION_PER_SHARE cannot be negative."
+        )
 
-            response.raise_for_status()
-            return response
+    if not STARTING_CAPITALS:
+        raise RuntimeError(
+            "No starting capital values configured."
+        )
 
-        except Exception as exc:
-            last_error = exc
-            if attempt < attempts - 1:
-                time.sleep(min(2 ** attempt, 20))
-
-    raise RuntimeError(f"API request failed: {url}; {last_error}")
-
-
-def fetch_active_symbols():
-    url = f"{TRADING_URL}/v2/assets"
-    response = api_get(
-        url,
-        {"status": "active", "asset_class": "us_equity"},
+    os.makedirs(
+        OUTPUT_DIR,
+        exist_ok=True
     )
 
-    symbols = []
-
-    for asset in response.json():
-        symbol = asset.get("symbol")
-
-        if (
-            symbol
-            and asset.get("tradable")
-            and asset.get("status") == "active"
-            and asset.get("class") in (None, "us_equity")
-            and "/" not in symbol
-            and "." not in symbol
-        ):
-            symbols.append(symbol)
-
-    log.info("Found %s active tradable symbols", len(symbols))
-    return sorted(set(symbols))
+    log.info(
+        "Configuration validated. "
+        "No live orders will be submitted."
+    )
 
 
-def fetch_bars(symbol, timeframe, start, end, limit=10000):
-    rows = []
-    token = None
-    url = f"{DATA_URL}/stocks/{symbol}/bars"
+# ============================================================
+# ALPACA API
+# ============================================================
+
+def alpaca_headers():
+
+    return {
+        "APCA-API-KEY-ID": API_KEY,
+        "APCA-API-SECRET-KEY": API_SECRET,
+    }
+
+
+def fetch_bars(
+    symbol,
+    start,
+    end,
+    timeframe="1Min"
+):
+    """
+    Download historical bars using pagination.
+
+    Uses split-adjusted data to reduce distortions from
+    stock splits.
+
+    Retries temporary failures and reports permanent errors.
+    """
+
+    url = (
+        f"{DATA_URL}/stocks/"
+        f"{symbol}/bars"
+    )
+
+    params = {
+        "timeframe": timeframe,
+        "start": start.isoformat(),
+        "end": end.isoformat(),
+        "limit": 10000,
+        "adjustment": "split",
+        "feed": DATA_FEED,
+        "sort": "asc",
+    }
+
+    all_rows = []
+    page_token = None
 
     while True:
-        params = {
-            "timeframe": timeframe,
-            "start": start.isoformat().replace("+00:00", "Z"),
-            "end": end.isoformat().replace("+00:00", "Z"),
-            "limit": limit,
-            "adjustment": "raw",
-            "feed": DATA_FEED,
-            "sort": "asc",
-        }
 
-        if token:
-            params["page_token"] = token
-
-        payload = api_get(url, params).json()
-        rows.extend(payload.get("bars", []))
-        token = payload.get("next_page_token")
-
-        if not token:
-            break
-
-    if not rows:
-        return pd.DataFrame()
-
-    df = pd.DataFrame(rows).rename(columns={
-        "t": "timestamp",
-        "o": "open",
-        "h": "high",
-        "l": "low",
-        "c": "close",
-        "v": "volume",
-        "n": "trade_count",
-        "vw": "vwap",
-    })
-
-    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
-
-    for col in ["open", "high", "low", "close", "volume"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    return (
-        df.dropna(subset=["timestamp", "open", "high", "low", "close", "volume"])
-        .sort_values("timestamp")
-        .drop_duplicates("timestamp")
-        .reset_index(drop=True)
-    )
-
-
-# ============================================================
-# HISTORICAL STOCK SCREEN
-# ============================================================
-
-def get_screened_universe(symbols, screen_start, test_start, screen_end):
-    ranked = []
-
-    for i, symbol in enumerate(symbols, 1):
-        try:
-            daily = fetch_bars(symbol, "1Day", screen_start, screen_end)
-
-            if daily.empty:
-                continue
-
-            daily = daily[daily["timestamp"] < pd.Timestamp(test_start)]
-
-            if len(daily) < 20:
-                continue
-
-            last_close = float(daily.iloc[-1]["close"])
-            recent = daily.tail(20)
-
-            avg_dollar_volume = float(
-                (recent["close"] * recent["volume"]).mean()
+        if page_token:
+            params["page_token"] = page_token
+        else:
+            params.pop(
+                "page_token",
+                None
             )
 
-            if (
-                last_close >= MIN_STOCK_PRICE
-                and avg_dollar_volume >= MIN_AVG_DOLLAR_VOLUME
-            ):
-                ranked.append((symbol, avg_dollar_volume, last_close))
+        response = None
 
-        except Exception as exc:
-            log.warning("Screen failed for %s: %s", symbol, exc)
+        for attempt in range(4):
 
-        if i % 100 == 0:
-            log.info("Screened %s/%s stocks", i, len(symbols))
+            try:
 
-    ranked.sort(key=lambda x: x[1], reverse=True)
-    selected = ranked[:MAX_SYMBOLS]
+                response = requests.get(
+                    url,
+                    headers=alpaca_headers(),
+                    params=params,
+                    timeout=60,
+                )
 
-    log.info("Selected %s stocks", len(selected))
-    return [x[0] for x in selected], selected
+                if response.status_code == 429:
 
+                    wait_seconds = 3 * (
+                        attempt + 1
+                    )
 
-# ============================================================
-# INTRADAY PREPARATION AND SIGNALS
-# ============================================================
+                    log.warning(
+                        "%s rate limited. "
+                        "Waiting %s seconds.",
+                        symbol,
+                        wait_seconds,
+                    )
 
-def prepare_intraday(df):
-    if df.empty:
-        return df
+                    time.sleep(wait_seconds)
+                    continue
 
-    out = df.copy()
-    out["timestamp_et"] = out["timestamp"].dt.tz_convert(ET)
-    out["date"] = out["timestamp_et"].dt.date
-    out["clock"] = out["timestamp_et"].dt.time
+                if response.status_code >= 500:
 
-    out = out[
-        (out["clock"] >= SESSION_OPEN)
-        & (out["clock"] < SESSION_CLOSE)
-        & (out["timestamp_et"].dt.weekday < 5)
+                    time.sleep(
+                        2 * (attempt + 1)
+                    )
+
+                    continue
+
+                response.raise_for_status()
+                break
+
+            except requests.RequestException as exc:
+
+                if attempt == 3:
+
+                    raise RuntimeError(
+                        f"Download failed for {symbol}: {exc}"
+                    ) from exc
+
+                time.sleep(
+                    2 * (attempt + 1)
+                )
+
+        if response is None:
+
+            raise RuntimeError(
+                f"No response received for {symbol}."
+            )
+
+        if not response.ok:
+
+            raise RuntimeError(
+                f"Alpaca returned HTTP "
+                f"{response.status_code} for {symbol}: "
+                f"{response.text[:300]}"
+            )
+
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise RuntimeError(
+                f"Invalid JSON returned for {symbol}."
+            ) from exc
+
+        rows = payload.get(
+            "bars",
+            []
+        )
+
+        all_rows.extend(rows)
+
+        page_token = payload.get(
+            "next_page_token"
+        )
+
+        if not page_token:
+            break
+
+    if not all_rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(all_rows)
+
+    required = {
+        "t",
+        "o",
+        "h",
+        "l",
+        "c",
+        "v",
+    }
+
+    if not required.issubset(df.columns):
+
+        raise RuntimeError(
+            f"Unexpected data columns for {symbol}: "
+            f"{list(df.columns)}"
+        )
+
+    df = df.rename(
+        columns={
+            "t": "timestamp",
+            "o": "open",
+            "h": "high",
+            "l": "low",
+            "c": "close",
+            "v": "volume",
+        }
+    )
+
+    df["timestamp"] = pd.to_datetime(
+        df["timestamp"],
+        utc=True,
+        errors="coerce",
+    )
+
+    for column in [
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+    ]:
+
+        df[column] = pd.to_numeric(
+            df[column],
+            errors="coerce",
+        )
+
+    df["symbol"] = symbol
+
+    df = df.dropna(
+        subset=[
+            "timestamp",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+        ]
+    )
+
+    df = df[
+        (df["open"] > 0)
+        & (df["high"] > 0)
+        & (df["low"] > 0)
+        & (df["close"] > 0)
+        & (df["volume"] >= 0)
+        & (df["high"] >= df["low"])
     ].copy()
 
-    return out.sort_values("timestamp").reset_index(drop=True)
+    df = df.drop_duplicates(
+        subset=[
+            "timestamp",
+            "symbol",
+        ]
+    )
+
+    return df.sort_values(
+        "timestamp"
+    ).reset_index(drop=True)
 
 
-def add_signals(df, fast_ema, slow_ema, breakout_lookback, volume_multiplier):
-    if df.empty:
-        return df
+# ============================================================
+# DOWNLOAD THE FIXED WATCHLIST
+# ============================================================
 
-    chunks = []
+def download_universe(start, end):
 
-    for _, day in df.groupby("date", sort=True):
-        day = day.copy().sort_values("timestamp")
+    frames = []
 
-        day["ema_fast"] = day["close"].ewm(
-            span=fast_ema, adjust=False
+    for symbol in SYMBOLS:
+
+        try:
+
+            log.info(
+                "Downloading %s: %s through %s",
+                symbol,
+                start.date(),
+                end.date(),
+            )
+
+            df = fetch_bars(
+                symbol,
+                start,
+                end,
+            )
+
+            if df.empty:
+
+                log.warning(
+                    "No data returned for %s.",
+                    symbol,
+                )
+
+                continue
+
+            frames.append(df)
+
+            log.info(
+                "%s downloaded bars: %s",
+                symbol,
+                len(df),
+            )
+
+        except Exception as exc:
+
+            log.error(
+                "Could not download %s: %s",
+                symbol,
+                exc,
+            )
+
+    if not frames:
+
+        raise RuntimeError(
+            "No market data was downloaded. "
+            "Check API credentials, data permissions, "
+            "network access, and the watchlist."
+        )
+
+    data = pd.concat(
+        frames,
+        ignore_index=True,
+    )
+
+    return data.sort_values(
+        ["timestamp", "symbol"]
+    ).reset_index(drop=True)
+
+
+# ============================================================
+# MARKET SESSION PREPARATION
+# ============================================================
+
+def prepare_intraday(data):
+
+    df = data.copy()
+
+    df["timestamp_et"] = (
+        df["timestamp"].dt.tz_convert(ET)
+    )
+
+    df["session_date"] = (
+        df["timestamp_et"].dt.date
+    )
+
+    df["session_time"] = (
+        df["timestamp_et"].dt.time
+    )
+
+    # Regular U.S. stock market session.
+    # Exchange holidays and early closes are handled
+    # using the last available bar for each symbol.
+    df = df[
+        (df["timestamp_et"].dt.dayofweek < 5)
+        & (
+            df["session_time"]
+            >= dt_time(9, 30)
+        )
+        & (
+            df["session_time"]
+            < dt_time(16, 0)
+        )
+    ].copy()
+
+    df = df.sort_values(
+        ["symbol", "timestamp"]
+    ).reset_index(drop=True)
+
+    df["is_session_last_bar"] = (
+        df.groupby(
+            ["symbol", "session_date"]
+        )["timestamp"].transform("max")
+        == df["timestamp"]
+    )
+
+    return df
+
+
+# ============================================================
+# SIGNAL GENERATION
+# ============================================================
+
+def add_signals(data, params):
+
+    (
+        fast,
+        slow,
+        breakout,
+        volume_mult,
+        stop_pct,
+        target_pct,
+        max_hold,
+    ) = params
+
+    df = data.copy()
+
+    df = df.sort_values(
+        ["symbol", "timestamp"]
+    ).reset_index(drop=True)
+
+    groups = df.groupby(
+        ["symbol", "session_date"],
+        sort=False,
+    )
+
+    # Moving averages use only the current session's bars.
+    df["ema_fast"] = groups["close"].transform(
+        lambda s: s.ewm(
+            span=fast,
+            adjust=False,
         ).mean()
+    )
 
-        day["ema_slow"] = day["close"].ewm(
-            span=slow_ema, adjust=False
+    df["ema_slow"] = groups["close"].transform(
+        lambda s: s.ewm(
+            span=slow,
+            adjust=False,
         ).mean()
+    )
 
-        typical = (day["high"] + day["low"] + day["close"]) / 3
-        day["cum_dollar_volume"] = (typical * day["volume"]).cumsum()
-        day["cum_volume"] = day["volume"].cumsum().replace(0, float("nan"))
-        day["session_vwap"] = day["cum_dollar_volume"] / day["cum_volume"]
+    typical_price = (
+        df["high"]
+        + df["low"]
+        + df["close"]
+    ) / 3.0
 
-        day["prior_high"] = (
-            day["high"].shift(1).rolling(breakout_lookback).max()
+    df["_dollar_volume"] = (
+        typical_price * df["volume"]
+    )
+
+    grouped_dollars = df.groupby(
+        ["symbol", "session_date"],
+        sort=False,
+    )["_dollar_volume"]
+
+    grouped_volume = df.groupby(
+        ["symbol", "session_date"],
+        sort=False,
+    )["volume"]
+
+    cumulative_dollars = (
+        grouped_dollars.cumsum()
+    )
+
+    cumulative_volume = (
+        grouped_volume.cumsum()
+    )
+
+    df["session_vwap"] = (
+        cumulative_dollars
+        / cumulative_volume.replace(
+            0,
+            float("nan"),
         )
+    )
 
-        day["prior_avg_volume"] = (
-            day["volume"].shift(1).rolling(20).mean()
+    # Exclude the current bar from the breakout threshold.
+    df["prior_high"] = groups["high"].transform(
+        lambda s: s.shift(1).rolling(
+            breakout,
+            min_periods=breakout,
+        ).max()
+    )
+
+    # Exclude current volume from the average.
+    df["prior_volume_avg"] = groups["volume"].transform(
+        lambda s: s.shift(1).rolling(
+            20,
+            min_periods=20,
+        ).mean()
+    )
+
+    df["signal"] = (
+        (df["ema_fast"] > df["ema_slow"])
+        & (df["close"] > df["session_vwap"])
+        & (df["close"] > df["prior_high"])
+        & (
+            df["volume"]
+            >= volume_mult * df["prior_volume_avg"]
         )
+        & (df["close"] >= MIN_STOCK_PRICE)
+        & (~df["is_session_last_bar"])
+    )
 
-        day["signal"] = (
-            (day["ema_fast"] > day["ema_slow"])
-            & (day["close"] > day["session_vwap"])
-            & (day["close"] > day["prior_high"])
-            & (day["volume"] >= volume_multiplier * day["prior_avg_volume"])
-        )
+    # Enter at the next bar's open.
+    df["entry_signal"] = (
+        df.groupby(
+            ["symbol", "session_date"]
+        )["signal"]
+        .shift(1)
+        .fillna(False)
+        .astype(bool)
+    )
 
-        day["next_timestamp"] = day["timestamp"].shift(-1)
-        day["next_open"] = day["open"].shift(-1)
-        chunks.append(day)
+    df = df.drop(
+        columns=["_dollar_volume"]
+    )
 
-    return (
-        pd.concat(chunks, ignore_index=True)
-        .sort_values("timestamp")
-        .reset_index(drop=True)
+    return df
+
+
+# ============================================================
+# EXECUTION COSTS AND POSITION SIZING
+# ============================================================
+
+def apply_slippage(price, side):
+
+    rate = SLIPPAGE_BPS / 10000.0
+
+    if side == "buy":
+        return price * (1.0 + rate)
+
+    return price * (1.0 - rate)
+
+
+def calculate_quantity(
+    allocation,
+    price,
+    cash,
+):
+
+    if (
+        allocation <= 0
+        or price <= 0
+        or cash <= 0
+    ):
+        return 0.0
+
+    budget = min(
+        allocation,
+        cash,
+    )
+
+    unit_cost = (
+        price + COMMISSION_PER_SHARE
+    )
+
+    if unit_cost <= 0:
+        return 0.0
+
+    qty = budget / unit_cost
+
+    if not ALLOW_FRACTIONAL:
+        qty = float(int(qty))
+
+    # Correct for floating-point rounding.
+    if ALLOW_FRACTIONAL:
+
+        qty = round(qty, 6)
+
+        while (
+            qty > 0
+            and qty * unit_cost > cash + 1e-8
+        ):
+            qty = round(
+                qty - 0.000001,
+                6,
+            )
+
+    return max(
+        0.0,
+        qty,
+    )
+
+
+def max_drawdown(equity_values):
+
+    if not equity_values:
+        return 0.0
+
+    series = pd.Series(
+        equity_values,
+        dtype=float,
+    )
+
+    peaks = series.cummax().replace(
+        0,
+        float("nan"),
+    )
+
+    drawdowns = (
+        series / peaks - 1.0
+    )
+
+    return float(
+        drawdowns.min()
     )
 
 
 # ============================================================
-# PORTFOLIO SIMULATION
+# BACKTEST ENGINE
 # ============================================================
 
-def run_simulation(symbol_frames, start, end, capital, params):
-    start_ts = pd.Timestamp(start)
-    end_ts = pd.Timestamp(end)
+def run_simulation(
+    data,
+    params,
+    starting_capital,
+):
 
-    cash = float(capital)
-    positions = {}
-    pending = []
-    trades = []
-    equity_rows = []
+    if data.empty:
 
-    max_positions_seen = 0
-    peak_equity = float(capital)
-    max_drawdown = 0.0
-    slip = SLIPPAGE_BPS_PER_SIDE / 10000.0
-
-    timeline = {}
-
-    for symbol, df in symbol_frames.items():
-        phase = df[
-            (df["timestamp"] >= start_ts)
-            & (df["timestamp"] <= end_ts)
-        ]
-
-        for row in phase.to_dict("records"):
-            timeline.setdefault(row["timestamp"], {})[symbol] = row
-
-    if not timeline:
         return {
-            "start_capital": capital,
-            "end_equity": capital,
+            "starting_capital": starting_capital,
+            "ending_equity": starting_capital,
             "return_pct": 0.0,
-            "trades": [],
-            "trade_count": 0,
+            "trades": 0,
+            "wins": 0,
+            "losses": 0,
             "win_rate": 0.0,
             "profit_factor": 0.0,
             "max_drawdown_pct": 0.0,
-            "max_positions": 0,
+            "trade_log": [],
             "equity_curve": [],
-            "avg_trade_pnl": 0.0,
         }
 
-    def mark_equity(rows):
-        value = cash
+    (
+        fast,
+        slow,
+        breakout,
+        volume_mult,
+        stop_pct,
+        target_pct,
+        max_hold,
+    ) = params
 
-        for symbol, pos in positions.items():
-            row = rows.get(symbol)
-            price = (
-                float(row["close"])
-                if row
-                else float(pos["last_price"])
-            )
-            value += pos["shares"] * price
+    df = data.sort_values(
+        ["timestamp", "symbol"]
+    ).copy()
 
-        return value
+    cash = float(starting_capital)
 
-    def close_position(symbol, raw_price, timestamp, reason):
-        nonlocal cash
+    positions = {}
+    trade_log = []
+    equity_curve = []
 
-        pos = positions.pop(symbol)
-        exit_price = max(0.01, float(raw_price) * (1 - slip))
-        shares = pos["shares"]
+    # Keep a last mark for any position whose symbol
+    # has no bar at the current market timestamp.
+    for timestamp, group in df.groupby(
+        "timestamp",
+        sort=True,
+    ):
 
-        gross_pnl = shares * (exit_price - pos["entry_price"])
-        commission = COMMISSION_PER_SHARE * shares * 2
-        pnl = gross_pnl - commission
+        rows = {
+            row["symbol"]: row
+            for _, row in group.iterrows()
+        }
 
-        cash += shares * exit_price - COMMISSION_PER_SHARE * shares
+        exited_this_bar = set()
 
-        trades.append({
-            "symbol": symbol,
-            "entry_time": pos["entry_time"].isoformat(),
-            "exit_time": timestamp.isoformat(),
-            "entry_price": pos["entry_price"],
-            "exit_price": exit_price,
-            "shares": shares,
-            "pnl": pnl,
-            "return_pct": (
-                (exit_price / pos["entry_price"] - 1) * 100
-            ),
-            "holding_minutes": (
-                timestamp - pos["entry_time"]
-            ).total_seconds() / 60,
-            "exit_reason": reason,
-            "target_pct": params["target"] * 100,
-            "stop_pct": params["stop"] * 100,
-            "fast_ema": params["fast_ema"],
-            "slow_ema": params["slow_ema"],
-            "breakout_lookback": params["breakout"],
-            "volume_multiplier": params["volume_multiplier"],
-            "max_hold_minutes": params["max_hold"],
-        })
+        # ----------------------------------------------------
+        # A. MANAGE EXISTING POSITIONS
+        # ----------------------------------------------------
 
-    for timestamp in sorted(timeline):
-        rows = timeline[timestamp]
+        for symbol in list(positions.keys()):
 
-        for symbol, pos in list(positions.items()):
-            if symbol in rows:
-                pos["last_price"] = float(rows[symbol]["close"])
-
-        ready = []
-        still_pending = []
-
-        for order in pending:
-            if timestamp < order["execute_at"]:
-                still_pending.append(order)
-            elif timestamp == order["execute_at"]:
-                if order["symbol"] in rows:
-                    ready.append((order["symbol"], order, rows[order["symbol"]]))
-
-        pending = still_pending
-
-        ready.sort(key=lambda item: item[1]["strength"], reverse=True)
-
-        for symbol, order, row in ready:
-            if symbol in positions or len(positions) >= MAX_POSITIONS:
+            if symbol not in rows:
                 continue
 
-            equity_now = mark_equity(rows)
-            budget = min(cash, equity_now * POSITION_ALLOCATION)
-            fill = float(row["open"]) * (1 + slip)
+            row = rows[symbol]
+            pos = positions[symbol]
 
-            if fill <= 0 or budget <= 0:
-                continue
-
-            if ALLOW_FRACTIONAL_SHARES:
-                shares = budget / fill
-            else:
-                shares = int(budget // fill)
-
-            if shares <= 0:
-                continue
-
-            cost = shares * fill + COMMISSION_PER_SHARE * shares
-
-            if cost > cash + 1e-8:
-                continue
-
-            cash -= cost
-
-            positions[symbol] = {
-                "shares": shares,
-                "entry_price": fill,
-                "entry_time": timestamp,
-                "stop_price": fill * (1 - params["stop"]),
-                "target_price": fill * (1 + params["target"]),
-                "last_price": float(row["open"]),
-            }
-
-            max_positions_seen = max(
-                max_positions_seen, len(positions)
-            )
-
-        for symbol, pos in list(positions.items()):
-            row = rows.get(symbol)
-
-            if not row:
-                continue
+            pos["bars_held"] += 1
 
             low = float(row["low"])
             high = float(row["high"])
-            open_price = float(row["open"])
+            close = float(row["close"])
 
-            # Conservative assumption: stop wins if stop and target
-            # are both touched within the same bar.
+            exit_reason = None
+            raw_exit = None
+
+            # Conservative intrabar ordering:
+            # assume the stop occurs first if both levels hit.
             if low <= pos["stop_price"]:
-                raw_exit = min(open_price, pos["stop_price"])
-                close_position(symbol, raw_exit, timestamp, "stop_loss")
+
+                raw_exit = pos["stop_price"]
+                exit_reason = "stop"
+
+            elif high >= pos["target_price"]:
+
+                raw_exit = pos["target_price"]
+                exit_reason = "target"
+
+            elif pos["bars_held"] >= max_hold:
+
+                raw_exit = close
+                exit_reason = "max_hold"
+
+            elif bool(row["is_session_last_bar"]):
+
+                raw_exit = close
+                exit_reason = "session_close"
+
+            if exit_reason is None:
+                pos["last_mark"] = close
                 continue
 
-            if high >= pos["target_price"]:
-                close_position(
-                    symbol,
-                    pos["target_price"],
-                    timestamp,
-                    "take_profit",
-                )
-                continue
+            exit_fill = apply_slippage(
+                float(raw_exit),
+                "sell",
+            )
 
-            held = (
-                timestamp - pos["entry_time"]
-            ).total_seconds() / 60
+            exit_fee = (
+                pos["qty"] * COMMISSION_PER_SHARE
+            )
 
-            if held >= params["max_hold"]:
-                close_position(
-                    symbol,
-                    float(row["close"]),
-                    timestamp,
-                    "max_hold",
-                )
-                continue
+            proceeds = (
+                pos["qty"] * exit_fill
+                - exit_fee
+            )
 
-            if timestamp.tz_convert(ET).time() >= dt_time(15, 59):
-                close_position(
-                    symbol,
-                    float(row["close"]),
-                    timestamp,
-                    "session_close",
-                )
+            cash += proceeds
+
+            net_pnl = (
+                proceeds - pos["entry_cost"]
+            )
+
+            trade_log.append({
+                "symbol": symbol,
+                "entry_time": pos["entry_time"],
+                "exit_time": timestamp,
+                "entry_price": pos["entry_price"],
+                "exit_price": exit_fill,
+                "quantity": pos["qty"],
+                "net_pnl": net_pnl,
+                "return_pct": (
+                    net_pnl / pos["entry_cost"]
+                    if pos["entry_cost"] > 0
+                    else 0.0
+                ),
+                "bars_held": pos["bars_held"],
+                "exit_reason": exit_reason,
+            })
+
+            del positions[symbol]
+            exited_this_bar.add(symbol)
+
+        # ----------------------------------------------------
+        # B. OPEN NEW POSITIONS
+        # ----------------------------------------------------
 
         for symbol, row in rows.items():
-            if not bool(row.get("signal", False)):
-                continue
 
-            next_ts = row.get("next_timestamp")
-
-            if pd.isna(next_ts) or next_ts <= timestamp:
-                continue
-
-            if next_ts.tz_convert(ET).date() != timestamp.tz_convert(ET).date():
-                continue
-
-            if next_ts > end_ts:
+            if not bool(row["entry_signal"]):
                 continue
 
             if symbol in positions:
                 continue
 
-            if any(order["symbol"] == symbol for order in pending):
+            # Avoid closing and reopening the same symbol
+            # on the same timestamp.
+            if symbol in exited_this_bar:
                 continue
 
-            prior_high = row.get("prior_high")
+            if len(positions) >= MAX_POSITIONS:
+                break
 
-            if pd.isna(prior_high) or prior_high <= 0:
+            raw_entry = float(row["open"])
+
+            if (
+                raw_entry < MIN_STOCK_PRICE
+                or raw_entry <= 0
+            ):
                 continue
 
-            strength = float(row["close"]) / float(prior_high) - 1
+            # Mark existing holdings to estimate equity.
+            marked_equity = cash
 
-            pending.append({
-                "symbol": symbol,
-                "execute_at": next_ts,
-                "strength": strength,
-            })
+            for held_symbol, held_pos in positions.items():
 
-        equity = mark_equity(rows)
-        peak_equity = max(peak_equity, equity)
+                if held_symbol in rows:
 
-        drawdown = (
-            (peak_equity - equity) / peak_equity
-            if peak_equity > 0
-            else 0
-        )
+                    mark = float(
+                        rows[held_symbol]["close"]
+                    )
 
-        max_drawdown = max(max_drawdown, drawdown)
+                else:
 
-        equity_rows.append({
-            "timestamp": timestamp.isoformat(),
+                    mark = held_pos["last_mark"]
+
+                marked_equity += (
+                    held_pos["qty"] * mark
+                )
+
+            allocation = (
+                marked_equity
+                * POSITION_ALLOCATION
+            )
+
+            entry_fill = apply_slippage(
+                raw_entry,
+                "buy",
+            )
+
+            qty = calculate_quantity(
+                allocation,
+                entry_fill,
+                cash,
+            )
+
+            if qty <= 0:
+                continue
+
+            entry_fee = (
+                qty * COMMISSION_PER_SHARE
+            )
+
+            entry_cost = (
+                qty * entry_fill + entry_fee
+            )
+
+            if entry_cost > cash + 1e-8:
+                continue
+
+            cash -= entry_cost
+
+            positions[symbol] = {
+                "entry_time": timestamp,
+                "entry_price": entry_fill,
+                "entry_cost": entry_cost,
+                "qty": qty,
+                "stop_price": (
+                    entry_fill * (1.0 - stop_pct)
+                ),
+                "target_price": (
+                    entry_fill * (1.0 + target_pct)
+                ),
+                "bars_held": 0,
+                "last_mark": float(row["close"]),
+            }
+
+            # Since entry is modeled at the current bar open,
+            # test the bar's range conservatively. OHLC data
+            # cannot establish the exact intrabar price sequence.
+            pos = positions[symbol]
+
+            low = float(row["low"])
+            high = float(row["high"])
+
+            exit_reason = None
+            raw_exit = None
+
+            if low <= pos["stop_price"]:
+
+                raw_exit = pos["stop_price"]
+                exit_reason = "stop_entry_bar"
+
+            elif high >= pos["target_price"]:
+
+                raw_exit = pos["target_price"]
+                exit_reason = "target_entry_bar"
+
+            elif bool(row["is_session_last_bar"]):
+
+                raw_exit = float(row["close"])
+                exit_reason = "session_close"
+
+            if exit_reason is not None:
+
+                exit_fill = apply_slippage(
+                    float(raw_exit),
+                    "sell",
+                )
+
+                exit_fee = (
+                    qty * COMMISSION_PER_SHARE
+                )
+
+                proceeds = (
+                    qty * exit_fill - exit_fee
+                )
+
+                cash += proceeds
+
+                net_pnl = (
+                    proceeds - entry_cost
+                )
+
+                trade_log.append({
+                    "symbol": symbol,
+                    "entry_time": timestamp,
+                    "exit_time": timestamp,
+                    "entry_price": entry_fill,
+                    "exit_price": exit_fill,
+                    "quantity": qty,
+                    "net_pnl": net_pnl,
+                    "return_pct": (
+                        net_pnl / entry_cost
+                        if entry_cost > 0
+                        else 0.0
+                    ),
+                    "bars_held": 0,
+                    "exit_reason": exit_reason,
+                })
+
+                del positions[symbol]
+                exited_this_bar.add(symbol)
+
+        # ----------------------------------------------------
+        # C. UPDATE EQUITY
+        # ----------------------------------------------------
+
+        equity = cash
+
+        for symbol, pos in positions.items():
+
+            if symbol in rows:
+
+                pos["last_mark"] = float(
+                    rows[symbol]["close"]
+                )
+
+            equity += (
+                pos["qty"] * pos["last_mark"]
+            )
+
+        equity_curve.append({
+            "timestamp": timestamp,
             "equity": equity,
             "cash": cash,
             "open_positions": len(positions),
         })
 
-    final_ts = max(timeline)
-    final_rows = timeline[final_ts]
+    # --------------------------------------------------------
+    # D. SAFETY CLOSE
+    # --------------------------------------------------------
 
-    for symbol in list(positions):
-        row = final_rows.get(symbol)
+    # No position should normally remain after the session-close
+    # logic. This is a fallback, not a substitute for valid data.
+    for symbol, pos in list(positions.items()):
 
-        raw_price = (
-            float(row["close"])
-            if row
-            else float(positions[symbol]["last_price"])
+        exit_fill = apply_slippage(
+            pos["last_mark"],
+            "sell",
         )
 
-        close_position(
-            symbol,
-            raw_price,
-            final_ts,
-            "phase_end_liquidation",
+        exit_fee = (
+            pos["qty"] * COMMISSION_PER_SHARE
         )
 
-    end_equity = cash
-    equity_rows.append({
-        "timestamp": final_ts.isoformat(),
-        "equity": end_equity,
-        "cash": cash,
-        "open_positions": 0,
-    })
+        proceeds = (
+            pos["qty"] * exit_fill - exit_fee
+        )
 
-    pnls = [trade["pnl"] for trade in trades]
-    winners = [pnl for pnl in pnls if pnl > 0]
-    losers = [pnl for pnl in pnls if pnl < 0]
+        cash += proceeds
 
-    gross_profit = sum(winners)
-    gross_loss = abs(sum(losers))
+        net_pnl = (
+            proceeds - pos["entry_cost"]
+        )
 
-    profit_factor = (
-        gross_profit / gross_loss
-        if gross_loss > 0
-        else (float("inf") if gross_profit > 0 else 0.0)
+        trade_log.append({
+            "symbol": symbol,
+            "entry_time": pos["entry_time"],
+            "exit_time": df["timestamp"].max(),
+            "entry_price": pos["entry_price"],
+            "exit_price": exit_fill,
+            "quantity": pos["qty"],
+            "net_pnl": net_pnl,
+            "return_pct": (
+                net_pnl / pos["entry_cost"]
+                if pos["entry_cost"] > 0
+                else 0.0
+            ),
+            "bars_held": pos["bars_held"],
+            "exit_reason": "safety_close",
+        })
+
+        del positions[symbol]
+
+    trades_df = pd.DataFrame(
+        trade_log
+    )
+
+    if trades_df.empty:
+
+        wins = 0
+        losses = 0
+        win_rate = 0.0
+        profit_factor = 0.0
+
+    else:
+
+        wins = int(
+            (trades_df["net_pnl"] > 0).sum()
+        )
+
+        losses = int(
+            (trades_df["net_pnl"] < 0).sum()
+        )
+
+        win_rate = (
+            wins / len(trades_df)
+        )
+
+        gross_profit = float(
+            trades_df.loc[
+                trades_df["net_pnl"] > 0,
+                "net_pnl",
+            ].sum()
+        )
+
+        gross_loss = abs(
+            float(
+                trades_df.loc[
+                    trades_df["net_pnl"] < 0,
+                    "net_pnl",
+                ].sum()
+            )
+        )
+
+        if gross_loss > 0:
+
+            profit_factor = (
+                gross_profit / gross_loss
+            )
+
+        elif gross_profit > 0:
+
+            profit_factor = float("inf")
+
+        else:
+
+            profit_factor = 0.0
+
+    curve = pd.DataFrame(
+        equity_curve
+    )
+
+    ending_equity = (
+        float(curve["equity"].iloc[-1])
+        if not curve.empty
+        else float(cash)
     )
 
     return {
-        "start_capital": capital,
-        "end_equity": end_equity,
-        "return_pct": (end_equity / capital - 1) * 100,
-        "trades": trades,
-        "trade_count": len(trades),
-        "win_rate": len(winners) / len(trades) * 100 if trades else 0.0,
+        "starting_capital": float(starting_capital),
+        "ending_equity": ending_equity,
+        "return_pct": (
+            ending_equity / starting_capital - 1.0
+        ),
+        "trades": len(trades_df),
+        "wins": wins,
+        "losses": losses,
+        "win_rate": win_rate,
         "profit_factor": profit_factor,
-        "max_drawdown_pct": max_drawdown * 100,
-        "max_positions": max_positions_seen,
-        "equity_curve": equity_rows,
-        "avg_trade_pnl": sum(pnls) / len(pnls) if pnls else 0.0,
+        "max_drawdown_pct": max_drawdown(
+            curve["equity"].tolist()
+        ),
+        "trade_log": trade_log,
+        "equity_curve": equity_curve,
     }
 
 
 # ============================================================
-# STRATEGY RESEARCH
+# STRATEGY SCORING
 # ============================================================
 
+def safe_float(value):
+
+    try:
+
+        result = float(value)
+
+        if pd.isna(result):
+            return 0.0
+
+        return result
+
+    except (TypeError, ValueError):
+
+        return 0.0
+
+
 def score_result(result):
-    if result["trade_count"] < MIN_TRAIN_TRADES:
-        return -1e9
 
-    pf = result["profit_factor"]
+    trades = int(
+        result["trades"]
+    )
 
-    if pf == float("inf"):
-        pf = 5.0
+    ret = safe_float(
+        result["return_pct"]
+    )
 
-    pf = min(pf, 5.0)
+    pf = safe_float(
+        result["profit_factor"]
+    )
+
+    drawdown = abs(
+        safe_float(
+            result["max_drawdown_pct"]
+        )
+    )
+
+    # Reject strategies with too few trades.
+    if trades < MIN_TRAIN_TRADES:
+        return -1000.0
+
+    # Reject unprofitable strategies from top ranking.
+    if ret <= 0:
+        return -100.0 + ret
+
+    if pf <= 1.0:
+        return -100.0 + ret
+
+    # Do not let an extreme PF dominate the score.
+    capped_pf = min(
+        pf,
+        3.0,
+    )
 
     return (
-        result["return_pct"]
-        + (pf - 1.0) * 2.0
-        - result["max_drawdown_pct"] * 0.5
+        ret
+        + 0.10 * (capped_pf - 1.0)
+        - 0.75 * drawdown
     )
 
 
-def params_grid():
-    combinations = product(
-        EMA_PAIRS,
-        BREAKOUT_LOOKBACKS,
+def validation_passes(result):
+
+    if result["trades"] < MIN_VALIDATION_TRADES:
+        return False
+
+    if result["return_pct"] <= MIN_VALIDATION_RETURN:
+        return False
+
+    if result["profit_factor"] <= MIN_VALIDATION_PROFIT_FACTOR:
+        return False
+
+    if abs(result["max_drawdown_pct"]) > MAX_VALIDATION_DRAWDOWN:
+        return False
+
+    return True
+
+
+# ============================================================
+# CHRONOLOGICAL DATA SPLITS
+# ============================================================
+
+def split_by_trading_day(data):
+
+    dates = sorted(
+        data["session_date"].dropna().unique()
+    )
+
+    if len(dates) < 60:
+
+        raise RuntimeError(
+            f"Only {len(dates)} trading sessions were found. "
+            "At least 60 sessions are required."
+        )
+
+    n = len(dates)
+
+    train_end = int(
+        n * TRAIN_FRACTION
+    )
+
+    validation_end = int(
+        n * (
+            TRAIN_FRACTION
+            + VALIDATION_FRACTION
+        )
+    )
+
+    train_dates = set(
+        dates[:train_end]
+    )
+
+    validation_dates = set(
+        dates[train_end:validation_end]
+    )
+
+    test_dates = set(
+        dates[validation_end:]
+    )
+
+    train = data[
+        data["session_date"].isin(train_dates)
+    ].copy()
+
+    validation = data[
+        data["session_date"].isin(validation_dates)
+    ].copy()
+
+    test = data[
+        data["session_date"].isin(test_dates)
+    ].copy()
+
+    if (
+        train.empty
+        or validation.empty
+        or test.empty
+    ):
+
+        raise RuntimeError(
+            "One or more chronological data splits are empty."
+        )
+
+    log.info(
+        "Training: %s to %s; %s sessions",
+        min(train_dates),
+        max(train_dates),
+        len(train_dates),
+    )
+
+    log.info(
+        "Validation: %s to %s; %s sessions",
+        min(validation_dates),
+        max(validation_dates),
+        len(validation_dates),
+    )
+
+    log.info(
+        "Final test: %s to %s; %s sessions",
+        min(test_dates),
+        max(test_dates),
+        len(test_dates),
+    )
+
+    return train, validation, test
+
+
+# ============================================================
+# PARAMETER GRID
+# ============================================================
+
+def parameter_grid():
+
+    combinations = []
+
+    for values in product(
+        FAST_EMAS,
+        SLOW_EMAS,
+        BREAKOUT_PERIODS,
         VOLUME_MULTIPLIERS,
-        STOP_LOSSES,
-        TARGET_RETURNS,
-        MAX_HOLD_MINUTES_OPTIONS,
-    )
+        STOP_PCTS,
+        TARGET_PCTS,
+        MAX_HOLD_BARS,
+    ):
 
-    for ema_pair, breakout, vol_mult, stop, target, max_hold in combinations:
-        fast, slow = ema_pair
+        (
+            fast,
+            slow,
+            breakout,
+            volume_mult,
+            stop,
+            target,
+            hold,
+        ) = values
 
         if fast >= slow:
             continue
 
-        yield {
-            "fast_ema": fast,
-            "slow_ema": slow,
-            "breakout": breakout,
-            "volume_multiplier": vol_mult,
-            "stop": stop,
-            "target": target,
-            "max_hold": max_hold,
-        }
+        combinations.append(values)
+
+    return combinations
 
 
 # ============================================================
-# MAIN RESEARCH LOOP
+# TRAINING AND VALIDATION
+# ============================================================
+
+def optimize_strategy(
+    train,
+    validation,
+):
+
+    candidates = parameter_grid()
+
+    log.info(
+        "Testing %s parameter combinations.",
+        len(candidates),
+    )
+
+    training_results = []
+
+    for index, params in enumerate(
+        candidates,
+        start=1,
+    ):
+
+        try:
+
+            signals = add_signals(
+                train,
+                params,
+            )
+
+            result = run_simulation(
+                signals,
+                params,
+                starting_capital=5000,
+            )
+
+            training_results.append({
+                "params": params,
+                "score": score_result(result),
+                "train_return": result["return_pct"],
+                "train_trades": result["trades"],
+                "train_win_rate": result["win_rate"],
+                "train_profit_factor": result["profit_factor"],
+                "train_drawdown": result["max_drawdown_pct"],
+            })
+
+        except Exception as exc:
+
+            log.exception(
+                "Training candidate failed: %s; %s",
+                params,
+                exc,
+            )
+
+        if index % 10 == 0:
+
+            log.info(
+                "Training progress: %s/%s",
+                index,
+                len(candidates),
+            )
+
+    if not training_results:
+
+        raise RuntimeError(
+            "No training candidates completed."
+        )
+
+    training_results.sort(
+        key=lambda item: item["score"],
+        reverse=True,
+    )
+
+    training_output = []
+
+    for item in training_results:
+
+        row = dict(item)
+
+        row["params"] = json.dumps(
+            row["params"]
+        )
+
+        training_output.append(row)
+
+    pd.DataFrame(
+        training_output
+    ).to_csv(
+        os.path.join(
+            OUTPUT_DIR,
+            "training_results.csv",
+        ),
+        index=False,
+    )
+
+    # Do not promote candidates that failed training scoring.
+    finalists = [
+        item
+        for item in training_results
+        if item["score"] > -100.0
+    ][:TOP_TRAIN_CANDIDATES]
+
+    if not finalists:
+
+        raise RuntimeError(
+            "NO STRATEGY PASSED TRAINING. "
+            "No strategy will be promoted."
+        )
+
+    validation_results = []
+
+    for index, item in enumerate(
+        finalists,
+        start=1,
+    ):
+
+        params = item["params"]
+
+        try:
+
+            signals = add_signals(
+                validation,
+                params,
+            )
+
+            result = run_simulation(
+                signals,
+                params,
+                starting_capital=5000,
+            )
+
+            passed = validation_passes(
+                result
+            )
+
+            validation_results.append({
+                "params": params,
+                "passed_validation": passed,
+                "validation_return": result["return_pct"],
+                "validation_trades": result["trades"],
+                "validation_win_rate": result["win_rate"],
+                "validation_profit_factor": result["profit_factor"],
+                "validation_drawdown": result["max_drawdown_pct"],
+                "training_score": item["score"],
+                "training_return": item["train_return"],
+                "training_trades": item["train_trades"],
+                "training_profit_factor": item["train_profit_factor"],
+            })
+
+        except Exception as exc:
+
+            log.exception(
+                "Validation candidate failed: %s; %s",
+                params,
+                exc,
+            )
+
+        log.info(
+            "Validation progress: %s/%s",
+            index,
+            len(finalists),
+        )
+
+    if not validation_results:
+
+        raise RuntimeError(
+            "No validation results were produced."
+        )
+
+    validation_output = []
+
+    for item in validation_results:
+
+        row = dict(item)
+
+        row["params"] = json.dumps(
+            row["params"]
+        )
+
+        validation_output.append(row)
+
+    pd.DataFrame(
+        validation_output
+    ).to_csv(
+        os.path.join(
+            OUTPUT_DIR,
+            "validation_results.csv",
+        ),
+        index=False,
+    )
+
+    accepted = [
+        item
+        for item in validation_results
+        if item["passed_validation"]
+    ]
+
+    if not accepted:
+
+        raise RuntimeError(
+            "NO STRATEGY PASSED VALIDATION. "
+            "No final strategy will be selected. "
+            "Review validation_results.csv."
+        )
+
+    # Choose only among strategies that passed all validation rules.
+    accepted.sort(
+        key=lambda item: (
+            item["validation_return"]
+            - 0.75 * abs(item["validation_drawdown"])
+        ),
+        reverse=True,
+    )
+
+    selected = accepted[0]
+
+    log.info(
+        "Strategy passed validation: %s",
+        selected["params"],
+    )
+
+    log.info(
+        "Validation return: %.2f%%",
+        100 * selected["validation_return"],
+    )
+
+    log.info(
+        "Validation profit factor: %.3f",
+        safe_float(
+            selected["validation_profit_factor"]
+        ),
+    )
+
+    return selected
+
+
+# ============================================================
+# FINAL UNTOUCHED TEST
+# ============================================================
+
+def run_final_test(
+    test,
+    selected,
+):
+
+    params = selected["params"]
+
+    test_signals = add_signals(
+        test,
+        params,
+    )
+
+    summary_rows = []
+    all_trades = []
+    all_curves = []
+
+    for capital in STARTING_CAPITALS:
+
+        result = run_simulation(
+            test_signals,
+            params,
+            starting_capital=capital,
+        )
+
+        summary_rows.append({
+            "starting_capital": capital,
+            "ending_equity": result["ending_equity"],
+            "net_profit_loss": (
+                result["ending_equity"] - capital
+            ),
+            "return_pct": result["return_pct"],
+            "trades": result["trades"],
+            "wins": result["wins"],
+            "losses": result["losses"],
+            "win_rate": result["win_rate"],
+            "profit_factor": result["profit_factor"],
+            "max_drawdown_pct": result["max_drawdown_pct"],
+            "max_positions": MAX_POSITIONS,
+            "position_allocation_pct": POSITION_ALLOCATION,
+            "slippage_bps_per_side": SLIPPAGE_BPS,
+            "fractional_shares_enabled": ALLOW_FRACTIONAL,
+        })
+
+        for trade in result["trade_log"]:
+
+            trade_row = dict(trade)
+
+            trade_row["starting_capital"] = capital
+
+            all_trades.append(
+                trade_row
+            )
+
+        for point in result["equity_curve"]:
+
+            curve_row = dict(point)
+
+            curve_row["starting_capital"] = capital
+
+            all_curves.append(
+                curve_row
+            )
+
+    summary = pd.DataFrame(
+        summary_rows
+    )
+
+    summary.to_csv(
+        os.path.join(
+            OUTPUT_DIR,
+            "final_test_summary.csv",
+        ),
+        index=False,
+    )
+
+    pd.DataFrame(
+        all_trades
+    ).to_csv(
+        os.path.join(
+            OUTPUT_DIR,
+            "final_test_trades.csv",
+        ),
+        index=False,
+    )
+
+    pd.DataFrame(
+        all_curves
+    ).to_csv(
+        os.path.join(
+            OUTPUT_DIR,
+            "final_test_equity_curves.csv",
+        ),
+        index=False,
+    )
+
+    return summary
+
+
+# ============================================================
+# EXPERIMENT HISTORY
+# ============================================================
+
+def save_experiment(
+    selected,
+    summary,
+    start,
+    end,
+):
+
+    path = os.path.join(
+        OUTPUT_DIR,
+        "experiment_history.csv",
+    )
+
+    record = {
+        "run_time_utc": datetime.now().isoformat(),
+        "data_start": start.isoformat(),
+        "data_end": end.isoformat(),
+        "symbols": ",".join(SYMBOLS),
+        "feed": DATA_FEED,
+        "parameters": json.dumps(
+            selected["params"]
+        ),
+        "validation_return": selected["validation_return"],
+        "validation_trades": selected["validation_trades"],
+        "validation_profit_factor": selected["validation_profit_factor"],
+        "validation_drawdown": selected["validation_drawdown"],
+        "max_positions": MAX_POSITIONS,
+        "position_allocation": POSITION_ALLOCATION,
+        "slippage_bps_per_side": SLIPPAGE_BPS,
+        "backtest_days": BACKTEST_DAYS,
+    }
+
+    for _, row in summary.iterrows():
+
+        capital = int(
+            row["starting_capital"]
+        )
+
+        record[
+            f"test_return_{capital}"
+        ] = row["return_pct"]
+
+        record[
+            f"test_trades_{capital}"
+        ] = row["trades"]
+
+        record[
+            f"test_profit_factor_{capital}"
+        ] = row["profit_factor"]
+
+        record[
+            f"test_drawdown_{capital}"
+        ] = row["max_drawdown_pct"]
+
+    new_df = pd.DataFrame(
+        [record]
+    )
+
+    if os.path.exists(path):
+
+        old_df = pd.read_csv(path)
+
+        new_df = pd.concat(
+            [old_df, new_df],
+            ignore_index=True,
+        )
+
+    new_df.to_csv(
+        path,
+        index=False,
+    )
+
+
+# ============================================================
+# MAIN
 # ============================================================
 
 def main():
-    now
+
+    validate_configuration()
+
+    end = datetime.now(
+        ET
+    ).replace(
+        second=0,
+        microsecond=0,
+    )
+
+    start = end - timedelta(
+        days=BACKTEST_DAYS
+    )
+
+    log.info("=" * 60)
+    log.info("AUTOMATED STRATEGY RESEARCH")
+    log.info("=" * 60)
+
+    log.info(
+        "Watchlist: %s",
+        ", ".join(SYMBOLS),
+    )
+
+    log.info(
+        "Maximum simultaneous positions: %s",
+        MAX_POSITIONS,
+    )
+
+    log.info(
+        "Starting account sizes: %s",
+        STARTING_CAPITALS,
+    )
+
+    log.info(
+        "Historical data feed: %s",
+        DATA_FEED,
+    )
+
+    raw_data = download_universe(
+        start,
+        end,
+    )
+
+    intraday = prepare_intraday(
+        raw_data
+    )
+
+    if intraday.empty:
+
+        raise RuntimeError(
+            "No regular-session data remains."
+        )
+
+    symbols_found = sorted(
+        intraday["symbol"].unique()
+    )
+
+    log.info(
+        "Symbols with usable data: %s",
+        ", ".join(symbols_found),
+    )
+
+    # IMPORTANT:
+    # There is deliberately no liquidity filter using the entire
+    # historical period. Such a filter would let future information
+    # influence the selection of symbols in the final test period.
+
+    train, validation, test = split_by_trading_day(
+        intraday
+    )
+
+    selected = optimize_strategy(
+        train,
+        validation,
+    )
+
+    log.info(
+        "A strategy passed validation. "
+        "Running the untouched final test."
+    )
+
+    summary = run_final_test(
+        test,
+        selected,
+    )
+
+    save_experiment(
+        selected,
+        summary,
+        start,
+        end,
+    )
+
+    log.info("=" * 60)
+    log.info("FINAL OUT-OF-SAMPLE RESULTS")
+    log.info("=" * 60)
+
+    for _, row in summary.iterrows():
+
+        log.info(
+            "$%s account | Ending equity: $%.2f | "
+            "Profit/Loss: $%.2f | Return: %.2f%% | "
+            "Trades: %s | Win rate: %.2f%% | "
+            "Profit factor: %.3f | Drawdown: %.2f%%",
+            int(row["starting_capital"]),
+            row["ending_equity"],
+            row["net_profit_loss"],
+            100 * row["return_pct"],
+            int(row["trades"]),
+            100 * row["win_rate"],
+            safe_float(row["profit_factor"]),
+            100 * row["max_drawdown_pct"],
+        )
+
+    log.info("=" * 60)
+    log.info("RESEARCH COMPLETED")
+    log.info("=" * 60)
+
+    log.info(
+        "Output directory: %s",
+        os.path.abspath(OUTPUT_DIR),
+    )
+
+    log.info(
+        "Reports: training_results.csv, "
+        "validation_results.csv, "
+        "final_test_summary.csv, "
+        "final_test_trades.csv, "
+        "final_test_equity_curves.csv, "
+        "experiment_history.csv"
+    )
+
+
+if __name__ == "__main__":
+    main()
