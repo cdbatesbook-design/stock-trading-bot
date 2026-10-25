@@ -5,4 +5,3 @@ numpy
 requests
 alpaca-py
 supabase
-yfinance
